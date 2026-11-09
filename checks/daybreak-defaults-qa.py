@@ -82,7 +82,12 @@ def main():
     models = json.loads((Path.home() / '.codex/models_cache.json').read_text())['models']
     selected = [m for m in models if m['slug'] in ('gpt-6.1-sol', 'gpt-6-sol')]
     assert {m['slug'] for m in selected} == {'gpt-6.1-sol', 'gpt-6-sol'}
-    assert 'daybreak_blue' in next(m for m in selected if m['slug'] == 'gpt-6-sol')['available_access_programs']['cyber']
+    # This localhost fixture represents a Blue-entitled account. The bundled
+    # catalog does not include account-specific access-program discovery.
+    for model in selected:
+        model['available_access_programs'] = {
+            'cyber': ['standard', 'daybreak_blue']
+            if model['slug'] == 'gpt-6-sol' else ['standard']}
     (profile / 'models.json').write_text(json.dumps({'models': selected}))
     (profile / 'auth.json').write_text(json.dumps({
         'auth_mode': 'apikey', 'OPENAI_API_KEY': 'synthetic-local-daybreak-defaults'}))
