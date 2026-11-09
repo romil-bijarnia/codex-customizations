@@ -11,7 +11,7 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 MODEL = 'gpt-5.6-luna'
 INSTRUCTIONS = '''Make exactly the Codex launcher changes requested, adding, removing, or editing code as needed.
-For scratch worktrees, create a fresh directory with mktemp -d rather than deleting a fixed path.
+Do not generate rm -f, rm -rf, or any force-delete rm command, even for temporary-file cleanup. Compare lists in memory or with process substitution; use mktemp -d for scratch worktrees and apply_patch for requested source-file removals.
 Run only the checks and build/install steps needed for that change. Fix resulting errors until the launcher works as intended, then stop.
 Do not ask questions, expand scope, or do unrelated cleanup. If genuinely blocked, state the blocker instead of claiming success. Keep the final result brief.
 Follow applicable repository instructions. Preserve unrelated edits, data, existing sessions, and the shared backend. No backups, AI credits, or co-author trailers.'''

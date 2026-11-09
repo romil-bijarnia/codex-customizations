@@ -158,7 +158,8 @@ class PlusOneTests(unittest.TestCase):
         self.assertEqual(self.requests('config/read')[0], {'cwd': str(ROOT), 'includeLayers': False})
         self.assertEqual(thread['developerInstructions'], '')
         self.assertIn('launcher', thread['baseInstructions'])
-        self.assertIn('mktemp -d rather than deleting a fixed path', thread['baseInstructions'])
+        for rule in ('rm -f', 'even for temporary-file cleanup', 'process substitution', 'mktemp -d'):
+            self.assertIn(rule, thread['baseInstructions'])
         for key in ('features.plugins', 'features.apps', 'features.hooks', 'agents.enabled', 'features.multi_agent_v2',
                     'features.memories', 'cloud.skills.enabled', 'skills.include_instructions',
                     'skills.bundled.enabled', 'mcp_servers.extra.enabled', 'mcp_servers.project.enabled'):
