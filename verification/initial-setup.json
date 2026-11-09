@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "repository": "romil-bijarnia/codex-customizations",
+  "channel": "upstream main by default",
+  "initial_verification_revision": "25f4940d4affcf8c60f96ffec5e3752e1f590b8a",
+  "initial_verification_was_pinned": true,
+  "package_label": "0.169.0-dev.20261109+romil.25f4940d4aff.0db64d12",
+  "native_version_output": "codex-cli 0.169.0-dev",
+  "patchset": "0db64d12fa341a0d2f9921950b818f83fcf8e3625fd4113114ed44a5b8410462",
+  "stored_native_patch_bytes": 118570,
+  "binary_sha256": {
+    "codex": "a0275608fc4e799089ef0cc3665ee31fb02e3eadd7763f74011f8b2469d0d3d1",
+    "codex-exec-server": "9778f939315d7669c2e5fc8f09a119da91567ab1a27d562b18f4298b112c6cd6",
+    "codex-code-mode-host": "d58e6ae0ea193c266a517705cfa827fafdfc63f8574e652e1542a48a20644c50"
+  },
+  "remote_check_suites": [
+    "defaults",
+    "picker-display",
+    "integrations-portable",
+    "regressions",
+    "steering"
+  ],
+  "local_checks_passed": [
+    "bundled-visualization-renderer"
+  ],
+  "updater_tests_passed": 9,
+  "live_profile_startup_exit": 0,
+  "kernel_activation_verified_by_remote_build": false,
+  "running_sessions_restarted_by_update_command": false,
+  "backend_rollout": "deferred until observed idle; active work not intentionally restarted",
+  "source_checkout_required_on_laptop_for_update": false,
+  "real_model_requests": 0,
+  "verification_run": "https://github.com/romil-bijarnia/codex-customizations/actions/runs/42555055597",
+  "artifact_release": "https://github.com/romil-bijarnia/codex-customizations/releases/tag/dev-25f4940d4aff-0db64d12fa34"
+}
