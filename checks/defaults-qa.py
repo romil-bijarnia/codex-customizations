@@ -71,8 +71,10 @@ trust_level = "trusted"
         term = qa.qa.Terminal(args.executable, profile, workspace)
         term.wait('OpenAI Codex')
         qa.until(term, lambda: footer(term, 'EL2 Control'), 'EL2 default did not activate.')
-        assert footer(term, 'GPT-6.1-Sol xhigh'), term.text()
-        assert footer(term, 'Daybreak off'), term.text()
+        qa.until(term, lambda: footer(term, 'GPT-6.1-Sol xhigh'),
+                 'Configured model and reasoning defaults did not activate.')
+        qa.until(term, lambda: footer(term, 'Daybreak off'),
+                 'Configured Daybreak default did not activate.')
         qa.snapshot(term, args.output, 'fresh-defaults')
         row = next(i for i, line in enumerate(term.screen.display)
                    if 'EL2 Control' in line and ' · ' in line)
@@ -110,8 +112,10 @@ trust_level = "trusted"
         report['checks'].append('An explicit per-thread Full Access choice survives resume despite the EL2 default.')
         term.command('/new')
         qa.until(term, lambda: footer(term, 'EL2 Control'), 'New conversation did not apply EL2 default.')
-        assert footer(term, 'GPT-6.1-Sol xhigh'), term.text()
-        assert footer(term, 'Daybreak off'), term.text()
+        qa.until(term, lambda: footer(term, 'GPT-6.1-Sol xhigh'),
+                 'New conversation did not apply model and reasoning defaults.')
+        qa.until(term, lambda: footer(term, 'Daybreak off'),
+                 'New conversation did not apply the Daybreak default.')
         qa.snapshot(term, args.output, 'new-defaults')
         report['checks'].append('The /new command reapplies all four defaults.')
         term.close()
