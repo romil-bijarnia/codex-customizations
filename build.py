@@ -93,6 +93,25 @@ def publish(output_dir, manifest):
     run(args)
 
 
+def source_times(source, restore=False):
+    # Cargo uses source mtimes. A fresh checkout must not invalidate every unchanged crate.
+    cache = Path.home() / '.cache/codex-customizations/source-fingerprints.json'
+    previous = {}
+    if restore and cache.exists():
+        try:previous = json.loads(cache.read_text())
+        except (ValueError, OSError):pass
+    records = {}
+    raw = subprocess.check_output(['git','-C',str(source),'ls-files','-z'])
+    for name in (p.decode() for p in raw.split(b'\0') if p):
+        path = source / name
+        if not path.is_file() or path.is_symlink():continue
+        digest = sha256(path)
+        if restore and previous.get(name, {}).get('sha256') == digest:
+            stamp = previous[name]['mtime_ns'];os.utime(path, ns=(stamp,stamp))
+        records[name] = {'sha256':digest,'mtime_ns':path.stat().st_mtime_ns}
+    if not restore:atomic_write(cache,json.dumps(records))
+
+
 def build(work, build_plan, output_dir):
     work.mkdir(parents=True, exist_ok=False)
     source = prepare(work / 'source', build_plan['upstream_commit'])
@@ -126,10 +145,14 @@ def build(work, build_plan, output_dir):
     from codex_package.targets import TARGET_SPECS
     from codex_package.v8 import resolve_codex_v8_cargo_env
     env.update(resolve_codex_v8_cargo_env(TARGET_SPECS[TARGET], environ=env, cache_root=Path.home() / '.cache/codex-customizations/v8'))
-    command = ['cargo', 'build', '--locked', '--release', '--jobs', '2']
+    command = ['cargo', 'build', '--locked', '--release', '--jobs', os.environ.get('CARGO_BUILD_JOBS', '2')]
     for project, binary in [('codex-cli', 'codex'), ('codex-exec-server-cli', 'codex-exec-server'), ('codex-code-mode-host', 'codex-code-mode-host'), ('codex-bwrap', 'bwrap')]:
         command += ['-p', project, '--bin', binary]
-    run(command, cwd=source / 'codex-rs', env=env)
+    source_times(source, restore=True)
+    try:
+        run(command, cwd=source / 'codex-rs', env=env)
+    finally:
+        source_times(source)
     unpacked = work / 'official';unpacked.mkdir()
     with tarfile.open(resource_archive) as bundle:bundle.extractall(unpacked, filter='data')
     metadata_files = list(unpacked.rglob('codex-package.json'))
@@ -154,11 +177,11 @@ def build(work, build_plan, output_dir):
     test_env = dict(os.environ, HOME=str(qa_home))
     test_env.pop('CODEX_HOME', None)
     suites = []
-    for name, script, extra in [('defaults','defaults-qa.py',[]),('picker-display','picker-order-qa.py',['--display-only']),('integrations','terminal-integrations-qa.py',[]),('regressions','cli-regression-qa.py',['--source',str(source)]),('steering','steering-qa.py',[])]:
+    for name, script, extra in [('defaults','defaults-qa.py',[]),('picker-display','picker-order-qa.py',['--display-only']),('integrations-portable','terminal-integrations-qa.py',['--without-bundled-renderer']),('regressions','cli-regression-qa.py',['--source',str(source)]),('steering','steering-qa.py',[])]:
         run([python, ROOT / 'checks' / script, package / 'bin/codex', work / 'checks' / name, *extra], env=test_env)
         suites.append(name)
     manifest = package_manifest(package, build_plan, check_suites=suites, real_model_requests=0,
-                                kernel_activation_verified=False, official_resources_tag=release['tag_name'], build_kind='remote-source-build')
+                                kernel_activation_verified=False, required_local_checks=['bundled-visualization-renderer'], official_resources_tag=release['tag_name'], build_kind='remote-source-build')
     (package / 'custom-build.json').write_text(json.dumps(manifest, indent=2) + '\n')
     manifest = archive_package(package, output_dir, manifest)
     return manifest

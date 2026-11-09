@@ -15,6 +15,7 @@ codex update          # follow current openai/codex main, preserving our changes
 codex update --check  # availability only; no build requested or package installed
 codex update --no-wait # request a missing remote build, return without installing
 codex custom-status  # selected build, upstream commit and stored-diff identity
+codex update --revision FULL_SHA # optional exact revision for recovery/validation
 ```
 
 The command updates this small checkout with a fast-forward pull, resolves the
@@ -61,8 +62,11 @@ checksum-pinned V8 artifacts and official package resources are used. The source
 workspace disappears with the runner; finished packages are release assets, not
 files committed into this repository.
 
-The checks cover defaults, picker display/order, helpers/voice selection/reminder
-behaviour, literal pastes/API arguments and steering. Kernel/EL2 activation cannot
+The remote checks cover defaults, picker display/order, helper dispatch, voice
+selection/reminder behaviour, literal pastes/API arguments and steering. The
+installed bundled Visualize plugin is a target-machine dependency, not present on
+a clean GitHub runner: its real renderer is checked locally before package
+selection, without opening a browser or changing settings. Kernel/EL2 activation cannot
 be established on a GitHub runner and is explicitly not reported as verified.
 The bootstrap package reuses the previously verified local build; it is labelled
 as reused, not as a newly compiled build of a newer upstream revision.
@@ -85,3 +89,9 @@ Python 3.12+, Git and the authenticated GitHub CLI are required. Native macOS an
 other architecture artifacts need their own workflow target before selection.
 Personal AGENTS.md, account state and machine-specific private instructions stay
 in the existing private GRID/profile installation, not this public repository.
+
+Compilation caching also records source hashes and timestamps. After a fresh
+checkout, only byte-identical tracked files regain their prior timestamps;
+changed files retain new timestamps and are rebuilt. This avoids rebuilding
+every unchanged workspace crate merely because CI performed a new checkout.
+Completed compilation is cached even if a subsequent runtime check fails.

@@ -27,7 +27,7 @@ def run(command, env=None):
     return result
 
 
-def helper_checks(binary, output):
+def helper_checks(binary, output, render_saved_file=True):
     results = []
     response = run([str(binary), "--help"])
     assert "visualize" in response.stdout and "api" in response.stdout
@@ -39,16 +39,17 @@ def helper_checks(binary, output):
     native_version = run([str(binary), "--version"]).stdout.strip()
     assert response.stdout.strip() == native_version, (response.stdout, native_version)
     results.append("API profile invokes this native version without logging in")
-    fragment = output / "test fragment.html"
-    fragment.write_text('<main><h1>Local visualization check</h1><p>Saved viewer.</p></main>\n')
-    response = run([str(binary), "visualize", str(fragment), "--no-open", "--json"])
-    viewer = json.loads(response.stdout)
-    data = Path(viewer["viewer"]).read_bytes()
-    assert hashlib.sha256(data).hexdigest() == viewer["sha256"]
-    assert viewer["opened"] is False and viewer["server_required"] is False
-    assert b"Local visualization check" in data
-    results.append("visualization renders a real saved file and preserves its hash")
-    (output / "viewer.json").write_text(json.dumps(viewer, indent=2) + "\n")
+    if render_saved_file:
+        fragment = output / "test fragment.html"
+        fragment.write_text('<main><h1>Local visualization check</h1><p>Saved viewer.</p></main>\n')
+        response = run([str(binary), "visualize", str(fragment), "--no-open", "--json"])
+        viewer = json.loads(response.stdout)
+        data = Path(viewer["viewer"]).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == viewer["sha256"]
+        assert viewer["opened"] is False and viewer["server_required"] is False
+        assert b"Local visualization check" in data
+        results.append("visualization renders a real saved file and preserves its hash")
+        (output / "viewer.json").write_text(json.dumps(viewer, indent=2) + "\n")
     fixture = output / "helper argument fixture"
     arguments = ["exec", "-c", 'model="name with spaces"', "--", "literal $(value)"]
     script = 'import json,sys; print(json.dumps(sys.argv[1:])); sys.exit(23)\n'
@@ -241,16 +242,22 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--only", choices=["helpers", "voices", "reminders"])
+    parser.add_argument("--without-bundled-renderer", action="store_true", help="Defer the installed-plugin renderer check to the target machine")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     checks = []
+    skipped = []
     with args.binary.open("rb") as stream:
         binary_hash = hashlib.file_digest(stream, "sha256").hexdigest()
     complete = False
     try:
         for name, function in [("helpers", helper_checks), ("voices", voice_checks), ("reminders", reminder_checks)]:
             if args.only is None or args.only == name:
-                results = function(args.binary, args.output)
+                if name == "helpers" and args.without_bundled_renderer:
+                    results = helper_checks(args.binary, args.output, render_saved_file=False)
+                    skipped.append("bundled visualization renderer: validated on target machine before installation")
+                else:
+                    results = function(args.binary, args.output)
                 checks.extend(results)
                 print(json.dumps({"passed": results}), flush=True)
         with args.binary.open("rb") as stream:
@@ -258,7 +265,7 @@ def main():
         complete = True
     finally:
         (args.output / "results.json").write_text(json.dumps({"binary": str(args.binary), "binary_sha256": binary_hash,
-            "complete": complete, "passed": checks}, indent=2) + "\n")
+            "complete": complete, "passed": checks, "skipped": skipped}, indent=2) + "\n")
 
 
 if __name__ == "__main__":

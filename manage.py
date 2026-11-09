@@ -2,10 +2,12 @@
 """Install published personal Codex builds; never merge or compile on the laptop."""
 import argparse
 import fcntl
+import importlib.util
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -83,9 +85,34 @@ def verify_package(package, manifest):
         raise RuntimeError(f'The downloaded executable reported an unexpected version: {actual}')
 
 
+def verify_local_checks(package, manifest):
+    passed = []
+    if 'bundled-visualization-renderer' not in manifest.get('required_local_checks', []):
+        return passed
+    helper = package / 'customizations/visualize-cli/visualize.py'
+    before = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec = importlib.util.spec_from_file_location('candidate_visualize', helper)
+        module = importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix='codex-render-check-') as temporary:
+            root = Path(temporary);fragment = root / 'fragment.html'
+            fragment.write_text('<main><h1>Codex update validation</h1></main>')
+            result = module.make_viewer(fragment, codex_home=CODEX_HOME, viewer_root=root / 'viewers')
+            if sha256(result['viewer']) != result['sha256']:
+                raise RuntimeError('The installed visualization renderer failed its content check.')
+        passed.append('bundled-visualization-renderer')
+    except (OSError, ValueError, ImportError) as error:
+        raise RuntimeError(f'The target-machine visualization check failed; the selected CLI is unchanged: {error}') from error
+    finally:
+        sys.dont_write_bytecode = before
+    return passed
+
+
 def select_package(package, manifest):
     """Check before selection; roll back in memory if committing the install fails."""
     verify_package(package, manifest)
+    local_checks = verify_local_checks(package, manifest)
     current = PACKAGES / 'current'
     previous = current.resolve(strict=True)
     destination = PACKAGES / 'releases' / ('custom-' + manifest['release_tag'])
@@ -110,7 +137,7 @@ def select_package(package, manifest):
                     previous_helpers.append((target, target.read_bytes() if target.exists() else None))
                     atomic_write(target, source.read_bytes(), 0o755)
             atomic_link(current, destination)
-            installed = dict(manifest, package=str(destination), installed_at=time.time())
+            installed = dict(manifest, package=str(destination), installed_at=time.time(), local_checks_passed=local_checks)
             atomic_write(STATE_FILE, json.dumps(installed, indent=2) + '\n')
         except BaseException:
             atomic_link(current, previous)
@@ -184,7 +211,9 @@ def update(args):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError('Another codex update is running; the working CLI was not changed.')
-        commit = api(f"repos/{CONFIG['upstream_repository']}/commits/{CONFIG['upstream_branch']}")['sha']
+        commit = args.revision or api(f"repos/{CONFIG['upstream_repository']}/commits/{CONFIG['upstream_branch']}")['sha']
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise RuntimeError("A revision must be the complete upstream commit SHA.")
         digest = patch_id()
         tag = release_tag(commit, digest)
         state = read_state()
@@ -246,6 +275,7 @@ def main():
     u = commands.add_parser('update', help='Install upstream development plus your recorded customizations')
     u.add_argument('--check', action='store_true', help='Show availability without requesting a build or installing')
     u.add_argument('--no-wait', action='store_true', help='Request a missing build and return without installing')
+    u.add_argument('--revision', help='Exact upstream commit for recovery or reproducible validation; default follows main')
     u.add_argument('--timeout', type=int, default=7200, help='Maximum seconds to wait for a remote build')
     u.add_argument('--kit-refreshed', action='store_true', help=argparse.SUPPRESS)
     commands.add_parser('status', help='Show the selected build and update channel')

@@ -13,6 +13,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import manage
 import common
+import build
+import shutil
 from common import sha256
 
 
@@ -77,6 +79,31 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual(common.patch_id(),before)
             source.write_text('changed source')
             self.assertNotEqual(common.patch_id(),before)
+
+    def test_missing_local_renderer_keeps_the_working_package(self):
+        package, manifest = self.candidate()
+        helper = package / 'customizations/visualize-cli/visualize.py'
+        helper.parent.mkdir(parents=True)
+        shutil.copy2(manage.ROOT / 'overlays/local-customizations/visualize-cli/visualize.py',helper)
+        manifest['required_local_checks'] = ['bundled-visualization-renderer']
+        with self.assertRaises(RuntimeError):manage.select_package(package,manifest)
+        self.assertEqual((self.packages / 'current').resolve(),self.old)
+
+    def test_cached_source_times_are_reused_only_for_identical_content(self):
+        source = self.home / 'source';source.mkdir()
+        file = source / 'input.rs';file.write_text('original source')
+        subprocess.run(['git','init','-q',str(source)],check=True)
+        subprocess.run(['git','-C',str(source),'add','.'],check=True)
+        stamp = file.stat().st_mtime_ns
+        with patch.object(build.Path,'home',return_value=self.home):
+            build.source_times(source)
+            os.utime(file,ns=(stamp+1000000000,stamp+1000000000))
+            build.source_times(source,restore=True)
+            self.assertEqual(file.stat().st_mtime_ns,stamp)
+            file.write_text('changed source')
+            os.utime(file,ns=(stamp+2000000000,stamp+2000000000))
+            build.source_times(source,restore=True)
+            self.assertEqual(file.stat().st_mtime_ns,stamp+2000000000)
 
     def test_archive_path_escape_is_rejected(self):
         archive = self.home / 'bad.tar.gz'
