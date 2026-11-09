@@ -158,7 +158,7 @@ class PlusOneTests(unittest.TestCase):
         self.assertEqual(self.requests('config/read')[0], {'cwd': str(ROOT), 'includeLayers': False})
         self.assertEqual(thread['developerInstructions'], '')
         self.assertIn('launcher', thread['baseInstructions'])
-        for key in ('features.plugins', 'features.apps', 'features.hooks', 'features.multi_agent',
+        for key in ('features.plugins', 'features.apps', 'features.hooks', 'agents.enabled', 'features.multi_agent_v2',
                     'features.memories', 'cloud.skills.enabled', 'skills.include_instructions',
                     'skills.bundled.enabled', 'mcp_servers.extra.enabled', 'mcp_servers.project.enabled'):
             self.assertIs(thread['config'][key], False, key)
