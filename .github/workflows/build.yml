@@ -38,18 +38,28 @@ jobs:
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang cmake libcap-dev libasound2-dev libudev-dev python3-venv
           python3 -m venv .venv
           .venv/bin/pip install pyte
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: cargo_cache
         if: steps.plan.outputs.exists != 'true'
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cache/codex-customizations
-          key: codex-linux-arm64-${{ steps.plan.outputs.commit }}
+          key: codex-linux-arm64-${{ steps.plan.outputs.commit }}-${{ hashFiles('patches/**', 'overlays/**') }}
           restore-keys: codex-linux-arm64-
       - name: Apply stored changes, build, check and publish
         if: steps.plan.outputs.exists != 'true'
         run: .venv/bin/python build.py build --plan "$RUNNER_TEMP/plan.json" --work "$RUNNER_TEMP/codex-build" --out "$RUNNER_TEMP/release" --publish
+      - name: Preserve completed compilation even if a later check fails
+        if: always() && steps.plan.outcome == 'success' && steps.plan.outputs.exists != 'true' && steps.cargo_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/codex-customizations
+          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
       - name: Publish failure details without changing any installation
         if: failure()
         run: |
