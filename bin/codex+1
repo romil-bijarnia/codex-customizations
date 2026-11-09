@@ -6,6 +6,7 @@ from pathlib import Path
 import readline
 import subprocess
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parent.parent
 MODEL = 'gpt-5.6-luna'
@@ -51,6 +52,8 @@ def main():
             completed = params['turn']
         elif method == 'error' and not params.get('willRetry', False):
             raise RuntimeError(params.get('error', {}).get('message', str(params)))
+        elif method == 'currentTime/read' and 'id' in message:
+            send({'id': message['id'], 'result': {'currentTimeAt': int(time.time())}})
         elif 'id' in message and method:
             send({'id': message['id'], 'error': {'code': -32601, 'message': 'Interactive requests are disabled.'}})
             raise RuntimeError(f'Unexpected backend request: {method}')
@@ -62,7 +65,7 @@ def main():
         send({'id': sequence, 'method': method, 'params': params})
         while True:
             message = receive()
-            if message.get('id') == sequence:
+            if 'method' not in message and message.get('id') == sequence:
                 if 'error' in message:
                     raise RuntimeError(message['error']['message'])
                 return message['result']

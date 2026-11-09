@@ -47,6 +47,14 @@ for line in sys.stdin:
     request = json.loads(line)
     record(request)
     method = request.get('method')
+    if method is None and mode == 'clock' and request.get('id') == 4:
+        now = request.get('result', {}).get('currentTimeAt')
+        if type(now) is not int or now <= 0:
+            sys.exit(5)
+        emit({'id': 4, 'result': {'turn': {'id': 'test-turn', 'status': 'inProgress'}}})
+        emit({'method': 'item/agentMessage/delta', 'params': {'delta': 'clock callback complete'}})
+        emit({'method': 'turn/completed', 'params': {'turn': {'id': 'test-turn', 'status': 'completed'}}})
+        continue
     if method == 'initialized':
         continue
     if method == 'initialize':
@@ -59,6 +67,9 @@ for line in sys.stdin:
               'model': 'other-model' if mode == 'wrong-model' else 'gpt-5.6-luna',
               'reasoningEffort': 'medium' if mode == 'wrong-effort' else 'xhigh'}})
     elif method == 'turn/start':
+        if mode == 'clock':
+            emit({'id': 4, 'method': 'currentTime/read', 'params': {'threadId': 'test-thread'}})
+            continue
         if mode == 'rpc-error':
             emit({'id': request['id'], 'error': {'code': -1, 'message': 'Daybreak access denied'}})
             continue
@@ -265,6 +276,16 @@ class PlusOneTests(unittest.TestCase):
         result = self.run_client(args=['test'], mode='retry')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, 'fixture complete\n')
+
+    def test_backend_clock_callback_with_same_id_as_pending_client_request(self):
+        before = int(time.time())
+        result = self.run_client(args=['test'], mode='clock')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'clock callback complete\n')
+        response = next(item for item in self.messages() if item.get('id') == 4 and 'result' in item)
+        self.assertLessEqual(before, response['result']['currentTimeAt'])
+        self.assertLessEqual(response['result']['currentTimeAt'], int(time.time()))
+        self.assert_backend_stopped()
 
     def test_completion_before_rpc_response_is_not_lost(self):
         result = self.run_client(args=['test'], mode='early-completion')
