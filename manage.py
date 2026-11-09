@@ -214,7 +214,7 @@ def update(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(prog='codex', description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     u = commands.add_parser('update', help='Install upstream development plus your recorded customizations')
     u.add_argument('--check', action='store_true', help='Show availability without requesting a build or installing')

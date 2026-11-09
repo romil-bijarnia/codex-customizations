@@ -65,6 +65,8 @@ def archive_package(package, output_dir, manifest):
         return info
     with tarfile.open(asset, 'w:gz', compresslevel=2) as bundle:
         bundle.add(package, arcname='package', filter=public_package)
+        if not (package / 'customizations').exists():
+            bundle.add(ROOT / 'overlays/local-customizations', arcname='package/customizations', filter=public_package)
         if not (package / 'custom-build.json').exists():
             content = (json.dumps(manifest, indent=2) + '\n').encode()
             info = tarfile.TarInfo('package/custom-build.json');info.size = len(content);info.mode = 0o644
