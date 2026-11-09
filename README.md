@@ -33,6 +33,36 @@ Ordinary CLI arguments are passed directly to the selected native executable.
 No prompt, account, chat history, personal database or access setting is replaced.
 The two owned API/visualization helpers are updated along with their native CLI.
 
+## Terminal-only launcher editor
+
+```sh
+codex+1                         # one plain prompt, apply change, exit
+codex + 1                       # same command
+codex +1 "make this change"      # one request, then exit
+cat request.txt | codex+1        # multiline code and context, one request
+```
+
+This small Python-standard-library client connects directly to the installed
+native `app-server` over stdio. It does not run the normal launcher UI or use an
+SDK. Authentication and actual editing/tool execution remain in the existing
+Codex backend; this is not a reimplementation of that backend. It requests
+exactly GPT-5.6-Luna, `xhigh`, and Daybreak Blue on every turn, fails on model
+rerouting, and never changes your ordinary launcher defaults.
+
+The working directory is this checkout. Its standing task is to apply your
+launcher changes, run only the checks and build/install steps needed for that
+change, and fix resulting errors until the launcher works as intended.
+It makes the smallest requested change, checks it, and exits; it does not start
+an ongoing chat, ask for confirmations, or restart existing chats. Plugins, apps,
+MCP servers, hooks, cloud/bundled skills, automatic skill instructions and
+memories are disabled for this thread. The conversation is ephemeral.
+
+Paste code/context at the plain prompt, then press Enter. Bracketed terminal
+pastes retain embedded newlines. Ctrl-D cancels input; Ctrl-C stops this client's
+dedicated backend, not the shared one. `CODEX_PLUS_CWD` can select a different
+checkout, including a disposable test fixture. Backend/API errors are reported
+as failures, not hidden by selecting a different model or access program.
+
 ## What is the stored difference?
 
 - `patches/personal-cli.patch`: code changes relative to the official commit in
