@@ -23,7 +23,10 @@ it downloads the finished package, verifies its checksum and executable hashes,
 and selects it atomically. Otherwise it requests GitHub Actions and waits, or
 returns immediately with `--no-wait`. GitHub CLI authentication is reused; no
 credentials are stored here. The working installation is retained on any patch,
-build, check or download failure. Existing chats/backends are not restarted.
+build, check or download failure. Existing chats are not restarted. The persistent backend is updated by a detached
+worker only after it observes no active loaded turns for 15 seconds. Failed or
+incomplete observations never count as idle. Progress is recorded under
+`$CODEX_HOME/state/codex-customizations/backend.json`.
 
 Ordinary CLI arguments are passed directly to the selected native executable.
 No prompt, account, chat history, personal database or access setting is replaced.

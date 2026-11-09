@@ -123,6 +123,18 @@ def select_package(package, manifest):
     return destination
 
 
+def start_backend_rollout(package):
+    STATE.mkdir(parents=True, exist_ok=True)
+    log = (STATE / 'backend.log').open('a')
+    try:
+        subprocess.Popen([sys.executable, str(ROOT / 'backend.py'), str(package)],
+                         env=dict(os.environ, CODEX_HOME=str(CODEX_HOME)),
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    finally:
+        log.close()
+
+
 def refresh_kit():
     if not (ROOT / '.git').is_dir():
         raise RuntimeError('Install the small customization repository before updating.')
@@ -210,7 +222,8 @@ def update(args):
             if manifest['upstream_commit'] != commit:
                 raise RuntimeError('Published source revision does not match the requested update.')
             destination = select_package(extract(archive, folder), manifest)
-        print(f"Installed {manifest['version']} at {destination}. Existing sessions were not restarted.")
+        start_backend_rollout(destination)
+        print(f"Installed {manifest['version']} at {destination}. Existing sessions were not restarted; the shared backend will update after observed idle time.")
 
 
 def main():

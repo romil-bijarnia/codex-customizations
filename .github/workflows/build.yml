@@ -24,6 +24,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+      - name: Check updater installation safety
+        run: python3 -m unittest discover -s tests -v
       - name: Resolve upstream and check for an existing build
         id: plan
         env:
