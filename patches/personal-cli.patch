@@ -1,0 +1,2734 @@
+diff --git a/codex-rs/cli/Cargo.toml b/codex-rs/cli/Cargo.toml
+index ffff79d3312d781d02b959ec36902822c4cb87da..0b64ae4d71152af75d23cfbb6d4de7e4a786b989 100644
+--- a/codex-rs/cli/Cargo.toml
++++ b/codex-rs/cli/Cargo.toml
+@@ -113,7 +113,7 @@ unicode-segmentation = { workspace = true }
+ url = { workspace = true }
+ which = { workspace = true }
+ 
+-[target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
++[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+ tikv-jemallocator = { workspace = true }
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
+diff --git a/codex-rs/cli/src/doctor.rs b/codex-rs/cli/src/doctor.rs
+index 87792d5f5ddd5cf56cf7b6920d2215b668dc87da..9e22aca52cd5294d1e361c00364ad71644793967 100644
+--- a/codex-rs/cli/src/doctor.rs
++++ b/codex-rs/cli/src/doctor.rs
+@@ -1611,7 +1611,10 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
+                             ));
+                         }
+                     } else if !env_var_present(env_var.name()) {
+-                        missing_env.push(format!("{name}: env var {} is not set", env_var.name()));
++                        details.push(format!(
++                            "{name}: optional forwarded env var {} is not set",
++                            env_var.name()
++                        ));
+                     }
+                 }
+             }
+@@ -3670,6 +3673,30 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn mcp_check_allows_absent_optional_forwarded_environment() {
++        let command = toml::Value::String(
++            std::env::current_exe()
++                .expect("current exe")
++                .to_string_lossy()
++                .into_owned(),
++        );
++        let server: McpServerConfig = toml::from_str(&format!(
++            r#"
++                command = {command}
++                required = true
++                env_vars = ["CODEX_DOCTOR_OPTIONAL_FORWARD_847153D1"]
++            "#,
++        ))
++        .expect("stdio config");
++        let check =
++            mcp_check_from_servers(&HashMap::from([("forwarder".to_string(), server)])).await;
++        assert_eq!(check.status, CheckStatus::Ok);
++        assert!(check.details.iter().any(|detail| {
++            detail.contains("optional forwarded env var CODEX_DOCTOR_OPTIONAL_FORWARD_847153D1")
++        }));
++    }
++
+     #[tokio::test]
+     async fn mcp_check_reports_both_missing_token_and_unreachable_url() {
+         let server = toml::from_str(
+diff --git a/codex-rs/cli/src/doctor/thread_inventory.rs b/codex-rs/cli/src/doctor/thread_inventory.rs
+index 46bd3bbf153a6eb4f6b1dc03f0bb8761630ad1b7..56e7d76776b05dc0cab1b19235306293a2f0b912 100644
+--- a/codex-rs/cli/src/doctor/thread_inventory.rs
++++ b/codex-rs/cli/src/doctor/thread_inventory.rs
+@@ -594,7 +594,17 @@ fn count_or_skipped(count: usize, complete: bool) -> String {
+ }
+ 
+ fn path_key(path: &Path) -> PathBuf {
+-    normalize_for_path_comparison(path).unwrap_or_else(|_| path.to_path_buf())
++    if let Ok(key) = normalize_for_path_comparison(path) {
++        return key;
++    }
++    // Compressed rollouts retain the absent .jsonl path as their logical key.
++    // Resolve its existing parent so aliases still compare as the same file.
++    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
++        && let Ok(parent) = normalize_for_path_comparison(parent)
++    {
++        return parent.join(name);
++    }
++    path.to_path_buf()
+ }
+ 
+ fn rollout_path_key(path: &Path) -> PathBuf {
+@@ -947,6 +957,33 @@ mod tests {
+         assert_detail(&check, "rollout DB stale rows", "0");
+     }
+ 
++    #[tokio::test]
++    #[cfg(unix)]
++    async fn thread_inventory_matches_compressed_rollout_through_symlink_alias() {
++        let fixture = Fixture::new().await;
++        let thread_id = "00000000-0000-0000-0000-000000000001";
++        let path = fixture.write_rollout(false, "2025-01-02T10-00-00", thread_id);
++        compress_rollout(&path);
++        let aliases = TempDir::new().expect("alias directory");
++        let alias = aliases.path().join("codex-home");
++        std::os::unix::fs::symlink(fixture.codex_home.path(), &alias).expect("home alias");
++        let aliased_path = alias.join(path.strip_prefix(fixture.codex_home.path()).unwrap());
++        fixture
++            .insert_thread_row(thread_id, &aliased_path, false)
++            .await;
++
++        let check = thread_inventory_check_for_roots(
++            fixture.codex_home.path(),
++            &fixture.sqlite(),
++            "test-provider",
++        )
++        .await;
++
++        assert_eq!(check.status, CheckStatus::Ok);
++        assert_detail(&check, "rollout DB missing active rows", "0");
++        assert_detail(&check, "rollout DB stale rows", "0");
++    }
++
+     #[tokio::test]
+     async fn thread_inventory_check_prefers_plain_rollout_over_compressed_sibling() {
+         let fixture = Fixture::new().await;
+diff --git a/codex-rs/cli/src/local_commands.rs b/codex-rs/cli/src/local_commands.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae49dac5a31096c3827401d32fa5862aec9db37f
+--- /dev/null
++++ b/codex-rs/cli/src/local_commands.rs
+@@ -0,0 +1,74 @@
++//! Dispatch the user's local helpers while retaining the native CLI entrypoint.
++
++use anyhow::Context;
++use clap::Args;
++use std::ffi::OsString;
++use std::path::PathBuf;
++use std::process::Command;
++
++#[derive(Debug, Args)]
++#[command(disable_help_flag = true, disable_help_subcommand = true)]
++pub(super) struct HelperArgs {
++    #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
++    pub(super) args: Vec<OsString>,
++}
++
++pub(super) enum Helper {
++    Visualize,
++    Api,
++}
++
++pub(super) fn direct_invocation(
++    args: impl IntoIterator<Item = OsString>,
++) -> Option<(Helper, Vec<OsString>)> {
++    let mut args = args.into_iter();
++    args.next()?;
++    let helper = match args.next()?.to_str()? {
++        "visualize" => Helper::Visualize,
++        "api" => Helper::Api,
++        _ => return None,
++    };
++    Some((helper, args.collect()))
++}
++
++pub(super) fn run(helper: Helper, args: Vec<OsString>) -> anyhow::Result<()> {
++    let script = match helper {
++        Helper::Visualize => codex_core::config::find_codex_home()?
++            .join("local-overrides/visualize-cli/visualize.py")
++            .to_path_buf(),
++        Helper::Api => std::env::var_os("HOME")
++            .filter(|home| !home.is_empty())
++            .map(PathBuf::from)
++            .context("HOME is not set; cannot locate the API profile helper")?
++            .join(".local/bin/codex-api-chat"),
++    };
++    anyhow::ensure!(
++        script.is_file(),
++        "Local Codex helper is missing: {}",
++        script.display()
++    );
++    let python = if cfg!(target_os = "macos")
++        && std::path::Path::new("/opt/homebrew/bin/python3").is_file()
++    {
++        "/opt/homebrew/bin/python3"
++    } else {
++        "/usr/bin/python3"
++    };
++    let mut command = Command::new(python);
++    command.arg(&script).args(args);
++    if matches!(helper, Helper::Api) && std::env::var_os("CODEX_API_BINARY").is_none() {
++        command.env("CODEX_API_BINARY", std::env::current_exe()?);
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::process::CommandExt;
++        Err(command.exec()).with_context(|| format!("Could not start {}", script.display()))
++    }
++    #[cfg(not(unix))]
++    {
++        let status = command
++            .status()
++            .with_context(|| format!("Could not start {}", script.display()))?;
++        std::process::exit(status.code().unwrap_or(1));
++    }
++}
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index a1462ee2a36535fba971389bf8ef8bda8ad9b8d5..0eb6af63209499ca10f37c7af37fd8442c01e6c4 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -45,7 +45,6 @@ use supports_color::Stream;
+ 
+ #[cfg(all(
+     target_os = "linux",
+-    target_env = "musl",
+     any(target_arch = "x86_64", target_arch = "aarch64")
+ ))]
+ #[global_allocator]
+@@ -65,6 +64,7 @@ mod exec_args_tests;
+ #[cfg(test)]
+ #[path = "exec_server_args_tests.rs"]
+ mod exec_server_args_tests;
++mod local_commands;
+ mod marketplace_cmd;
+ mod mcp_cmd;
+ mod mcp_login;
+@@ -143,6 +143,12 @@ struct MultitoolCli {
+ 
+ #[derive(Debug, clap::Subcommand)]
+ enum Subcommand {
++    /// Open a saved local visualization in your browser.
++    Visualize(local_commands::HelperArgs),
++
++    /// Use the separate API-key profile.
++    Api(local_commands::HelperArgs),
++
+     /// Open the agent command center to browse and switch sessions.
+     Agents(AgentsCommand),
+ 
+@@ -1041,6 +1047,11 @@ fn stage_str(stage: Stage) -> &'static str {
+ 
+ fn main() -> anyhow::Result<()> {
+     codex_build_info::initialize!();
++    // Preserve helper arguments, including --help and nested -c overrides,
++    // before the native CLI interprets its own global options.
++    if let Some((helper, args)) = local_commands::direct_invocation(std::env::args_os()) {
++        return local_commands::run(helper, args);
++    }
+     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
+     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
+         // Finish polling the large subcommand dispatcher before polling interactive TUI events.
+@@ -1113,6 +1124,20 @@ async fn dispatch_cli(
+     };
+     let open_agents_overview = matches!(&subcommand, Some(Subcommand::Agents(_)));
+     match subcommand {
++        Some(Subcommand::Visualize(args)) => {
++            local_commands::run(local_commands::Helper::Visualize, args.args)?;
++            return Ok(None);
++        }
++        Some(Subcommand::Api(args)) => {
++            let args = root_config_overrides
++                .raw_overrides
++                .into_iter()
++                .flat_map(|value| [std::ffi::OsString::from("-c"), value.into()])
++                .chain(args.args)
++                .collect();
++            local_commands::run(local_commands::Helper::Api, args)?;
++            return Ok(None);
++        }
+         None | Some(Subcommand::Agents(_)) => {
+             prepend_config_flags(
+                 &mut interactive.config_overrides,
+@@ -2376,6 +2401,8 @@ fn unsupported_subcommand_name_for_strict_config(
+             Some(app_server_subcommand_name(app_server.subcommand.as_ref()))
+         }
+         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
++        Some(Subcommand::Visualize(_)) => Some("visualize"),
++        Some(Subcommand::Api(_)) => Some("api"),
+         Some(Subcommand::Mcp(_)) => Some("mcp"),
+         Some(Subcommand::Plugin(_)) => Some("plugin"),
+         Some(Subcommand::MigrateRollouts(_)) => Some("migrate-rollouts"),
+diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+index 4bf90c42274e58b99331e8dd27925e54045f7047..672ec5ae0683352b3abfe5caed33ed54ed77e44c 100644
+--- a/codex-rs/core/src/client_tests.rs
++++ b/codex-rs/core/src/client_tests.rs
+@@ -1391,6 +1391,10 @@ fn reasoning_effort_for_requests_falls_back_for_missing_or_invalid_override() {
+ fn reasoning_effort_for_requests_preserves_non_ultra_and_persistent_behavior() {
+     let mut model_info = test_model_info();
+     model_info.multi_agent_reasoning_effort = Some(ReasoningEffort::Low);
++    model_info.supported_reasoning_levels = vec![ReasoningEffortPreset {
++        effort: ReasoningEffort::Max,
++        description: "max".to_string(),
++    }];
+ 
+     assert_eq!(
+         (
+@@ -1401,10 +1405,7 @@ fn reasoning_effort_for_requests_preserves_non_ultra_and_persistent_behavior() {
+                 ReasoningEffort::Persistent,
+             ),
+         ),
+-        (
+-            ReasoningEffort::High,
+-            ReasoningEffort::Custom("disabled".to_string()),
+-        )
++        (ReasoningEffort::High, ReasoningEffort::Max,)
+     );
+ }
+ 
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index f95157512e14b17a098c2c2e2683391bab8ac444..987ee728de6d41dbd87c31e9b421937822f02158 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -1,5 +1,7 @@
+ //! Root of the `codex-core` library.
+ 
++// Nested async tool dispatch exceeds the default layout-query depth on Rust 1.95.
++#![recursion_limit = "256"]
+ // Prevent accidental direct writes to stdout/stderr in library code. All
+ // user-visible output must go through the appropriate abstraction (e.g.,
+ // the TUI or the tracing stack).
+diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
+index b3edf15ae1de6ddf70dcfa491731404a98fe16e0..90c19d5a9da764a57bffcefb7319298b8a93f6b7 100644
+--- a/codex-rs/features/src/lib.rs
++++ b/codex-rs/features/src/lib.rs
+@@ -264,6 +264,8 @@ pub enum Feature {
+     WakeOnAgentMessages,
+     /// Preempt responses and yield foreground code-mode observations on new user input.
+     InstantInterrupt,
++    /// Submit terminal follow-ups immediately instead of scheduling another turn.
++    SteerOnly,
+     /// Interrupt upstream inference when a turn is cancelled.
+     InterruptOnCancel,
+     /// Enable shared discussion tools for an agent tree.
+@@ -1358,6 +1360,12 @@ pub const FEATURES: &[FeatureSpec] = &[
+         stage: Stage::UnderDevelopment,
+         default_enabled: true,
+     },
++    FeatureSpec {
++        id: Feature::SteerOnly,
++        key: "steer_only",
++        stage: Stage::Stable,
++        default_enabled: false,
++    },
+     FeatureSpec {
+         id: Feature::InterruptOnCancel,
+         key: "interrupt_on_cancel",
+diff --git a/codex-rs/protocol/src/openai_models/reasoning_effort.rs b/codex-rs/protocol/src/openai_models/reasoning_effort.rs
+index b4709202c3b27b669fd22f7a1ca09c859334bf47..830d2a894c1893fb8ef94eb65c5c72f2c528924e 100644
+--- a/codex-rs/protocol/src/openai_models/reasoning_effort.rs
++++ b/codex-rs/protocol/src/openai_models/reasoning_effort.rs
+@@ -13,31 +13,47 @@ impl ModelInfo {
+                 .multi_agent_reasoning_effort
+                 .as_ref()
+                 .filter(|effort| {
+-                    *effort != &ReasoningEffort::Ultra
++                    !matches!(effort, ReasoningEffort::Ultra | ReasoningEffort::Persistent)
+                         && self
+                             .supported_reasoning_levels
+                             .iter()
+                             .any(|preset| &preset.effort == *effort)
+                 })
+                 .cloned()
+-                .or_else(|| {
+-                    self.supported_reasoning_levels
+-                        .iter()
+-                        .find(|preset| preset.effort == ReasoningEffort::Max)
+-                        .or_else(|| {
+-                            self.supported_reasoning_levels
+-                                .iter()
+-                                .rev()
+-                                .find(|preset| preset.effort != ReasoningEffort::Ultra)
+-                        })
+-                        .map(|preset| preset.effort.clone())
+-                })
+-                .unwrap_or(ReasoningEffort::Medium),
+-            // Keep "persistent" in local settings; the Responses API calls it "disabled".
+-            ReasoningEffort::Persistent => ReasoningEffort::Custom("disabled".to_string()),
++                .unwrap_or_else(|| self.strongest_inference_reasoning_effort()),
++            ReasoningEffort::Persistent => {
++                if self
++                    .supported_reasoning_levels
++                    .iter()
++                    .any(|preset| preset.effort == ReasoningEffort::Persistent)
++                {
++                    // Preserve the native wire alias for models that advertise it.
++                    ReasoningEffort::Custom("disabled".to_string())
++                } else {
++                    // Keep persistence in session settings and instructions, but
++                    // do not send an unsupported inference effort to the API.
++                    self.strongest_inference_reasoning_effort()
++                }
++            }
+             effort => effort,
+         }
+     }
++
++    fn strongest_inference_reasoning_effort(&self) -> ReasoningEffort {
++        self.supported_reasoning_levels
++            .iter()
++            .find(|preset| preset.effort == ReasoningEffort::Max)
++            .or_else(|| {
++                self.supported_reasoning_levels.iter().rev().find(|preset| {
++                    !matches!(
++                        preset.effort,
++                        ReasoningEffort::Ultra | ReasoningEffort::Persistent
++                    )
++                })
++            })
++            .map(|preset| preset.effort.clone())
++            .unwrap_or(ReasoningEffort::Medium)
++    }
+ }
+ #[cfg(test)]
+ #[path = "reasoning_effort_tests.rs"]
+diff --git a/codex-rs/protocol/src/openai_models/reasoning_effort_tests.rs b/codex-rs/protocol/src/openai_models/reasoning_effort_tests.rs
+index e36fe3a256a01ebbd7ddf01af92306565181e681..43cfaafd81721a21ccd587fda2dfe108c99510ab 100644
+--- a/codex-rs/protocol/src/openai_models/reasoning_effort_tests.rs
++++ b/codex-rs/protocol/src/openai_models/reasoning_effort_tests.rs
+@@ -18,6 +18,11 @@ fn resolves_ultra_using_model_override_and_supported_fallbacks() {
+         (vec![High, XHigh, Ultra], None, XHigh),
+         (vec![High, XHigh, Ultra], Some(Ultra), XHigh),
+         (vec![High, XHigh, Ultra], Some(Low), XHigh),
++        (
++            vec![High, XHigh, Ultra, ReasoningEffort::Persistent],
++            Some(ReasoningEffort::Persistent),
++            XHigh,
++        ),
+         (vec![], None, Medium),
+     ] {
+         let mut model = test_model(/*spec*/ None);
+@@ -35,7 +40,7 @@ fn resolves_ultra_using_model_override_and_supported_fallbacks() {
+ 
+ #[test]
+ fn preserves_native_efforts_and_translates_persistent_mode() {
+-    let model = test_model(/*spec*/ None);
++    let mut model = test_model(/*spec*/ None);
+     for effort in [
+         ReasoningEffort::Low,
+         ReasoningEffort::Medium,
+@@ -45,8 +50,41 @@ fn preserves_native_efforts_and_translates_persistent_mode() {
+     ] {
+         assert_eq!(model.resolve_reasoning_effort(effort.clone()), effort);
+     }
++    model
++        .supported_reasoning_levels
++        .push(ReasoningEffortPreset {
++            effort: ReasoningEffort::Persistent,
++            description: String::new(),
++        });
+     assert_eq!(
+         model.resolve_reasoning_effort(ReasoningEffort::Persistent),
+         ReasoningEffort::Custom("disabled".to_string()),
+     );
+ }
++
++#[test]
++fn persistent_uses_supported_inference_reasoning_without_a_native_alias() {
++    use ReasoningEffort::High;
++    use ReasoningEffort::Max;
++    use ReasoningEffort::Medium;
++    use ReasoningEffort::Persistent;
++    use ReasoningEffort::Ultra;
++    use ReasoningEffort::XHigh;
++
++    for (supported, expected) in [
++        (vec![High, Max, Ultra], Max),
++        (vec![High, XHigh, Ultra], XHigh),
++        (vec![High, Ultra], High),
++        (vec![], Medium),
++    ] {
++        let mut model = test_model(/*spec*/ None);
++        model.supported_reasoning_levels = supported
++            .into_iter()
++            .map(|effort| ReasoningEffortPreset {
++                effort,
++                description: String::new(),
++            })
++            .collect();
++        assert_eq!(model.resolve_reasoning_effort(Persistent), expected);
++    }
++}
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 84a42c3ef4c4b4e269da3a56a86e865fcec94d31..c6acd605dbf05d9b8408f75e50131661668f2c5e 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -230,6 +230,7 @@ mod config_persistence;
+ mod connector_mentions;
+ mod daemon_menu;
+ mod daybreak;
++mod el2_control;
+ mod empty_state_policy;
+ mod event_dispatch;
+ mod exit_summary;
+diff --git a/codex-rs/tui/src/app/config_persistence.rs b/codex-rs/tui/src/app/config_persistence.rs
+index cb28791ff105ec3db16fbdde3eea30bb84a60649..d4cdf4430de7582e47102c41ffe17c87fa1414a2 100644
+--- a/codex-rs/tui/src/app/config_persistence.rs
++++ b/codex-rs/tui/src/app/config_persistence.rs
+@@ -276,11 +276,11 @@ impl App {
+         &mut self,
+         app_server: &mut AppServerSession,
+         mut selection: PermissionProfileSelection,
+-    ) {
++    ) -> bool {
+         if self.reject_pending_permission_change() {
+             self.chat_widget
+                 .retain_input_after_failed_permission_selection();
+-            return;
++            return false;
+         }
+         let Some(thread_id) = self.chat_widget.thread_id() else {
+             self.chat_widget
+@@ -288,7 +288,7 @@ impl App {
+             self.chat_widget.add_error_message(
+                 "Wait for the task to connect before selecting permissions.".into(),
+             );
+-            return;
++            return false;
+         };
+         let config = self.chat_widget.config_ref();
+         let already_selected = !self
+@@ -310,7 +310,7 @@ impl App {
+                 .selected_permission_profiles
+                 .insert(thread_id, selection.profile_id);
+             self.chat_widget.submit_initial_user_message_if_pending();
+-            return;
++            return true;
+         }
+         let params = ThreadSettingsUpdateParams {
+             thread_id: thread_id.to_string(),
+@@ -353,18 +353,21 @@ impl App {
+                     /*hint*/ None,
+                 );
+                 self.chat_widget.submit_initial_user_message_if_pending();
++                true
+             }
+             Ok(false) => {
+                 self.chat_widget
+                     .retain_input_after_failed_permission_selection();
+                 self.chat_widget
+                     .add_error_message("Permission selection requires a newer app server.".into());
++                false
+             }
+             Err(error) => {
+                 self.chat_widget
+                     .retain_input_after_failed_permission_selection();
+                 self.chat_widget
+                     .add_error_message(format!("Failed to select permissions: {error:#}"));
++                false
+             }
+         }
+     }
+diff --git a/codex-rs/tui/src/app/daybreak.rs b/codex-rs/tui/src/app/daybreak.rs
+index 31a70f2a9dab830896b8c2239f51b7a86dd674d8..a7a6b15b0f127f8d7f88af310b7fad4bcaf5795d 100644
+--- a/codex-rs/tui/src/app/daybreak.rs
++++ b/codex-rs/tui/src/app/daybreak.rs
+@@ -1,8 +1,83 @@
+ //! Persist the user's Daybreak selection for the active thread and new threads.
+ 
+ use super::*;
++use crate::app_server_session::ThreadSettingsOwner;
++use codex_protocol::openai_models::ReasoningEffort;
++
++#[derive(serde::Serialize, serde::Deserialize)]
++struct DaybreakReturnSelection {
++    model: String,
++    effort: Option<ReasoningEffort>,
++}
+ 
+ impl App {
++    fn daybreak_return_path(&self, thread_id: ThreadId) -> std::path::PathBuf {
++        self.config
++            .codex_home
++            .join("state/daybreak-return")
++            .join(format!("{thread_id}.json"))
++            .to_path_buf()
++    }
++
++    fn read_daybreak_return(
++        &self,
++        thread_id: ThreadId,
++    ) -> std::io::Result<Option<DaybreakReturnSelection>> {
++        match std::fs::read(self.daybreak_return_path(thread_id)) {
++            Ok(bytes) => serde_json::from_slice(&bytes)
++                .map(Some)
++                .map_err(std::io::Error::other),
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
++            Err(error) => Err(error),
++        }
++    }
++
++    fn write_daybreak_return(
++        &self,
++        thread_id: ThreadId,
++        selection: &DaybreakReturnSelection,
++    ) -> std::io::Result<()> {
++        let path = self.daybreak_return_path(thread_id);
++        let parent = path.parent().expect("Daybreak return directory");
++        std::fs::create_dir_all(parent)?;
++        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
++        serde_json::to_writer(&mut temporary, selection).map_err(std::io::Error::other)?;
++        temporary.persist(path).map_err(|error| error.error)?;
++        Ok(())
++    }
++
++    fn clear_daybreak_return(&mut self, thread_id: ThreadId) {
++        if let Err(error) = std::fs::remove_file(self.daybreak_return_path(thread_id))
++            && error.kind() != std::io::ErrorKind::NotFound
++        {
++            self.chat_widget.add_error_message(format!(
++                "Failed to clear the Daybreak return model: {error}"
++            ));
++        }
++    }
++
++    async fn apply_daybreak_model(
++        &mut self,
++        app_server: &mut AppServerSession,
++        model: String,
++        effort: Option<ReasoningEffort>,
++    ) -> bool {
++        if self.chat_widget.current_model() == model
++            && self.chat_widget.effective_reasoning_effort() == effort
++        {
++            return true;
++        }
++        if app_server.thread_params_mode().settings_owner() == ThreadSettingsOwner::Server {
++            self.select_session_model(app_server, model.clone(), effort.clone(), None)
++                .await;
++        } else {
++            self.apply_default_model_selection(app_server, model.clone(), effort.clone())
++                .await;
++        }
++        self.chat_widget.current_model() == model
++            && self.chat_widget.effective_reasoning_effort() == effort
++    }
++
+     pub(super) async fn persist_daybreak_selection(
+         &mut self,
+         app_server: &mut AppServerSession,
+@@ -27,6 +102,145 @@ impl App {
+             );
+             return;
+         }
++        let return_selection = if enabled {
++            Some(DaybreakReturnSelection {
++                model: self.chat_widget.current_model().to_string(),
++                effort: self.chat_widget.effective_reasoning_effort().or_else(|| {
++                    self.chat_widget
++                        .model_catalog()
++                        .models
++                        .iter()
++                        .find(|model| model.model == self.chat_widget.current_model())
++                        .map(|model| model.default_reasoning_effort.clone())
++                }),
++            })
++        } else {
++            match self.read_daybreak_return(thread_id) {
++                Ok(selection) => selection,
++                Err(error) => {
++                    self.chat_widget.add_error_message(format!(
++                        "Failed to read the model to restore after Daybreak: {error}"
++                    ));
++                    return;
++                }
++            }
++        };
++        let switch_to_sol = enabled
++            && crate::daybreak::program_for_turn(
++                &self.chat_widget.model_catalog().models,
++                self.chat_widget.current_model(),
++                self.chat_widget.daybreak_account_eligible(),
++                /*enabled*/ true,
++            )
++            .is_err();
++        if switch_to_sol {
++            let supported = self.chat_widget.model_catalog().models.iter().any(|model| {
++                model.model == "gpt-6-sol"
++                    && model
++                        .available_access_programs
++                        .as_ref()
++                        .and_then(codex_protocol::openai_models::ModelAccessPrograms::daybreak)
++                        .is_some()
++                    && return_selection.as_ref().is_some_and(|selection| {
++                        selection.effort.as_ref().is_none_or(|effort| {
++                            model
++                                .supported_reasoning_efforts
++                                .iter()
++                                .any(|option| &option.effort == effort)
++                        })
++                    })
++            });
++            if !supported || self.chat_widget.restrict_model_picker_to_luna_reserve() {
++                self.chat_widget.add_error_message(
++                    "Daybreak requires GPT-6-Sol with your current reasoning level, but that combination is unavailable. Your model and Daybreak setting were not changed.".into(),
++                );
++                return;
++            }
++        }
++        if enabled && !self.chat_widget.daybreak_enabled {
++            if let Err(error) = app_server.thread_read(thread_id, false).await {
++                self.chat_widget.add_error_message(format!(
++                    "Failed to read the thread to save Daybreak: {error}"
++                ));
++                return;
++            }
++            if let Err(error) = self.write_daybreak_return(
++                thread_id,
++                return_selection.as_ref().expect("original model selection"),
++            ) {
++                self.chat_widget.add_error_message(format!(
++                    "Failed to remember the model to restore after Daybreak: {error}"
++                ));
++                return;
++            }
++        }
++        if switch_to_sol
++            && !self
++                .apply_daybreak_model(
++                    app_server,
++                    "gpt-6-sol".into(),
++                    return_selection
++                        .as_ref()
++                        .and_then(|selection| selection.effort.clone()),
++                )
++                .await
++        {
++            self.chat_widget.add_error_message(
++                "Could not switch to GPT-6-Sol at the current reasoning level; Daybreak was not enabled.".into(),
++            );
++            return;
++        }
++        if !self
++            .save_daybreak_preference(app_server, thread_id, enabled)
++            .await
++        {
++            if switch_to_sol
++                && let Some(selection) = return_selection
++                && self
++                    .apply_daybreak_model(app_server, selection.model, selection.effort)
++                    .await
++            {
++                self.clear_daybreak_return(thread_id);
++            }
++            return;
++        }
++        if !enabled {
++            if let Some(selection) = return_selection
++                && !self
++                    .apply_daybreak_model(app_server, selection.model, selection.effort)
++                    .await
++            {
++                self.chat_widget.add_error_message(
++                    "Daybreak is off, but the original model and reasoning level could not be restored.".into(),
++                );
++                return;
++            }
++            self.clear_daybreak_return(thread_id);
++        }
++    }
++
++    pub(super) async fn disable_daybreak_for_model_change(
++        &mut self,
++        app_server: &mut AppServerSession,
++        thread_id: ThreadId,
++    ) {
++        if self
++            .save_daybreak_preference(app_server, thread_id, false)
++            .await
++        {
++            self.clear_daybreak_return(thread_id);
++        }
++    }
++
++    async fn save_daybreak_preference(
++        &mut self,
++        app_server: &mut AppServerSession,
++        thread_id: ThreadId,
++        enabled: bool,
++    ) -> bool {
++        if self.active_thread_id != Some(thread_id) {
++            return false;
++        }
+         match app_server
+             .thread_read(thread_id, /*include_turns*/ false)
+             .await
+@@ -50,7 +264,7 @@ impl App {
+                     self.chat_widget.add_error_message(format!(
+                         "Failed to save Daybreak for this thread: {error}"
+                     ));
+-                    return;
++                    return false;
+                 }
+             }
+             Ok(_) => {}
+@@ -58,7 +272,7 @@ impl App {
+                 self.chat_widget.add_error_message(format!(
+                     "Failed to read the thread to save Daybreak: {error}"
+                 ));
+-                return;
++                return false;
+             }
+         }
+         self.chat_widget.set_daybreak_enabled(enabled);
+@@ -119,5 +333,6 @@ impl App {
+             ),
+             /*hint*/ None,
+         );
++        true
+     }
+ }
+diff --git a/codex-rs/tui/src/app/el2_control.rs b/codex-rs/tui/src/app/el2_control.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e451141089882cddb92d7bc6d8586c250271b9d5
+--- /dev/null
++++ b/codex-rs/tui/src/app/el2_control.rs
+@@ -0,0 +1,94 @@
++//! Selecting EL2 performs activation on the active app server before adopting the mode.
++
++use super::*;
++
++impl App {
++    pub(super) fn activate_el2_control(
++        &mut self,
++        app_server: &AppServerSession,
++        thread_id: Option<ThreadId>,
++        quiet: bool,
++    ) {
++        if thread_id.is_none() || self.chat_widget.thread_id() != thread_id {
++            self.chat_widget.add_error_message(
++                "Wait for this task to connect before enabling EL2 Control.".into(),
++            );
++            return;
++        }
++        if self.reject_pending_permission_change() {
++            return;
++        }
++        let Some(request_id) = self.chat_widget.begin_el2_control_activation() else {
++            return;
++        };
++        let handle = app_server.request_handle();
++        let cwd = self.chat_widget.config_ref().cwd.to_path_buf();
++        let sender = self.app_event_tx.clone();
++        tokio::spawn(async move {
++            let result = crate::el2_control::activate(handle, cwd).await;
++            sender.send(AppEvent::El2ControlActivated {
++                thread_id,
++                request_id,
++                quiet,
++                result,
++            });
++        });
++    }
++
++    pub(super) async fn on_el2_control_activated(
++        &mut self,
++        app_server: &mut AppServerSession,
++        thread_id: Option<ThreadId>,
++        request_id: uuid::Uuid,
++        quiet: bool,
++        result: Result<crate::el2_control::Activation, String>,
++    ) {
++        if self.chat_widget.thread_id() != thread_id
++            || !self.chat_widget.finish_el2_control_activation(request_id)
++        {
++            return;
++        }
++        if self
++            .chat_widget
++            .complete_inline_permission_profile_selection()
++        {
++            self.app_event_tx.send(AppEvent::SettingsSelectionClosed);
++        }
++        let activation = match result {
++            Ok(activation) => activation,
++            Err(error) => {
++                self.chat_widget
++                    .add_error_message(format!("Could not enable EL2 Control: {error}"));
++                return;
++            }
++        };
++        if quiet {
++            if self
++                .chat_widget
++                .config_ref()
++                .permissions
++                .effective_permission_profile()
++                == PermissionProfile::Disabled
++            {
++                self.chat_widget.enable_el2_control_selection(&activation);
++            }
++            return;
++        }
++        let selection = PermissionProfileSelection {
++            profile_id: codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS
++                .to_string(),
++            approval_policy: Some(AskForApproval::Never),
++            approvals_reviewer: Some(ApprovalsReviewer::User),
++            display_label: crate::el2_control::LABEL.to_string(),
++        };
++        if self.select_permission_profile(app_server, selection).await {
++            self.chat_widget.enable_el2_control_selection(&activation);
++            let message = if self.chat_widget.el2_control_is_active() {
++                format!("EL2 Control enabled on {}", activation.kernel_release)
++            } else {
++                "EL2 interface verified; waiting for permissions to update.".to_string()
++            };
++            self.chat_widget.add_info_message(message, None);
++        }
++    }
++}
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 4acd12990eea361cdf2c18266e5e06aa7c62d373..90e679b419efd797e11f674db389ea845e46deed 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -2892,6 +2892,9 @@ impl App {
+             AppEvent::PersistDaybreakSelection { thread_id, enabled } => {
+                 self.persist_daybreak_selection(app_server, thread_id, enabled).await;
+             }
++            AppEvent::DisableDaybreakForModelChange { thread_id } => {
++                self.disable_daybreak_for_model_change(app_server, thread_id).await;
++            }
+             AppEvent::SelectSessionModel { model, effort, service_tier } => {
+                 self.app_event_tx.send(AppEvent::FollowTranscript);
+                 self.select_session_model(app_server, model, effort, service_tier).await;
+@@ -3060,6 +3063,9 @@ impl App {
+                 self.chat_widget.submit_initial_user_message_if_pending();
+             }
+             AppEvent::SelectPermissionProfile(selection) => {
++                if selection.display_label != crate::el2_control::LABEL {
++                    self.chat_widget.clear_el2_control_selection();
++                }
+                 let inline_selection = self
+                     .chat_widget
+                     .complete_inline_permission_profile_selection();
+@@ -3068,6 +3074,12 @@ impl App {
+                     self.app_event_tx.send(AppEvent::SettingsSelectionClosed);
+                 }
+             }
++            AppEvent::ActivateEl2Control { thread_id, quiet } => {
++                self.activate_el2_control(app_server, thread_id, quiet);
++            }
++            AppEvent::El2ControlActivated { thread_id, request_id, quiet, result } => {
++                self.on_el2_control_activated(app_server, thread_id, request_id, quiet, result).await;
++            }
+             AppEvent::UpdateApprovalsReviewer(policy) => {
+                 if self.reject_pending_permission_change() {
+                     return Ok(AppRunControl::Continue);
+diff --git a/codex-rs/tui/src/app/owned_transcript.rs b/codex-rs/tui/src/app/owned_transcript.rs
+index 7834b9c675224ca77607117fbf0546d53b1fe2c4..b5f4ace34eeab2dcac687683d8141143dde994f3 100644
+--- a/codex-rs/tui/src/app/owned_transcript.rs
++++ b/codex-rs/tui/src/app/owned_transcript.rs
+@@ -877,7 +877,14 @@ impl App {
+         }
+         if let TuiEvent::Mouse(mouse) = event {
+             let composer_ready = self.chat_widget.prepare_composer_mouse(*mouse);
+-            if mouse.kind != crossterm::event::MouseEventKind::Moved {
++            // Wheel bursts update the viewport; the scheduled frame presents it.
++            // Repainting before every tick queues work that is already obsolete.
++            if !matches!(
++                mouse.kind,
++                crossterm::event::MouseEventKind::Moved
++                    | crossterm::event::MouseEventKind::ScrollUp
++                    | crossterm::event::MouseEventKind::ScrollDown
++            ) {
+                 self.refresh_owned_transcript(tui)?;
+             }
+             if self
+diff --git a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+index d8c96a49425e839f71dc99a14052218fd9fce36f..2b28d46af4656b00822401e4cb7607f77828a954 100644
+--- a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
++++ b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+@@ -587,6 +587,14 @@ async fn queued_start_rejection_restores_the_draft() -> Result<()> {
+ pub(super) type RecordedRequests = Arc<Mutex<Vec<JSONRPCRequest>>>;
+ pub(super) type RecordingAppServer = (AppServerSession, RecordedRequests, JoinHandle<Result<()>>);
+ 
++fn daybreak_return_path_for_test(app: &App, thread_id: ThreadId) -> std::path::PathBuf {
++    app.config
++        .codex_home
++        .join("state/daybreak-return")
++        .join(format!("{thread_id}.json"))
++        .to_path_buf()
++}
++
+ fn is_recording_client_disconnect(error: &WebSocketError) -> bool {
+     match error {
+         WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+@@ -600,6 +608,89 @@ fn is_recording_client_disconnect(error: &WebSocketError) -> bool {
+     }
+ }
+ 
++#[tokio::test]
++async fn daybreak_command_switches_and_restores_the_model_and_reasoning() -> Result<()> {
++    use codex_protocol::openai_models::ModelAccessPrograms;
++    use codex_protocol::turn_input::CyberAccessProgram;
++
++    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
++    let (mut server, _requests, proxy) =
++        start_recording_app_server(&app.config, None, None).await?;
++    let started = server.start_thread(&app.config).await?;
++    let thread_id = started.session.thread_id;
++    app.active_thread_id = Some(thread_id);
++    app.chat_widget.handle_thread_session_quiet(started.session);
++    app.chat_widget.update_account_state(None, None, true, true);
++    app.chat_widget.open_model_popup();
++    let request_id = std::iter::from_fn(|| events.try_recv().ok())
++        .filter_map(|event| match event {
++            AppEvent::FetchModels { request_id } => Some(request_id),
++            _ => None,
++        })
++        .last()
++        .expect("model catalog request");
++    let original_model = app.chat_widget.current_model().to_string();
++    let original_effort = app.chat_widget.effective_reasoning_effort();
++    let mut original = crate::test_support::TEST_MODEL_PRESETS[0].clone();
++    original.model = original_model.clone();
++    original.available_access_programs = Some(ModelAccessPrograms {
++        cyber: vec![CyberAccessProgram::Standard],
++    });
++    let mut sol = original.clone();
++    sol.model = "gpt-6-sol".into();
++    sol.available_access_programs = Some(ModelAccessPrograms {
++        cyber: vec![
++            CyberAccessProgram::Standard,
++            CyberAccessProgram::DaybreakBlue,
++        ],
++    });
++    app.chat_widget
++        .on_models_loaded(request_id, Ok(vec![original, sol]));
++    app.chat_widget
++        .handle_key_event(KeyEvent::from(KeyCode::Esc));
++
++    app.persist_daybreak_selection(&mut server, thread_id, true)
++        .await;
++    assert!(app.chat_widget.daybreak_enabled);
++    assert_eq!(app.chat_widget.current_model(), "gpt-6-sol");
++    assert_eq!(
++        app.chat_widget.effective_reasoning_effort(),
++        original_effort
++    );
++    assert!(daybreak_return_path_for_test(&app, thread_id).is_file());
++
++    app.persist_daybreak_selection(&mut server, thread_id, false)
++        .await;
++    assert!(!app.chat_widget.daybreak_enabled);
++    assert_eq!(app.chat_widget.current_model(), original_model);
++    assert_eq!(
++        app.chat_widget.effective_reasoning_effort(),
++        original_effort
++    );
++    assert!(!daybreak_return_path_for_test(&app, thread_id).exists());
++
++    app.persist_daybreak_selection(&mut server, thread_id, true)
++        .await;
++    assert!(app.chat_widget.daybreak_enabled);
++    while events.try_recv().is_ok() {}
++    app.chat_widget.set_model(&original_model);
++    assert!(!app.chat_widget.daybreak_enabled);
++    let disable = std::iter::from_fn(|| events.try_recv().ok())
++        .find(|event| matches!(event, AppEvent::DisableDaybreakForModelChange { .. }))
++        .expect("disable Daybreak after an incompatible model selection");
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    app.handle_event(&mut tui, &mut server, disable).await?;
++    assert_eq!(app.chat_widget.current_model(), original_model);
++    assert!(!daybreak_return_path_for_test(&app, thread_id).exists());
++    assert_eq!(
++        server.thread_read(thread_id, false).await?.daybreak_enabled,
++        Some(false)
++    );
++    server.shutdown().await?;
++    proxy.await??;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
+     use codex_protocol::openai_models::ModelAccessPrograms;
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index 326457bb8ef9bb1522c03d038958204f04d992cc..d8a8b6e1a7ed89a3e05226acf1f6ee683a08be8c 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -1507,6 +1507,10 @@ pub(crate) enum AppEvent {
+         thread_id: ThreadId,
+         enabled: bool,
+     },
++    /// Disable Daybreak after an incompatible explicit model choice, without restoring a model.
++    DisableDaybreakForModelChange {
++        thread_id: ThreadId,
++    },
+ 
+     /// Fetch the current catalog even when cached models produce no picker.
+     FetchModels {
+@@ -1732,6 +1736,18 @@ pub(crate) enum AppEvent {
+     /// Re-open the permissions presets popup.
+     OpenPermissionsPopup,
+ 
++    /// Activate and verify the owner EL2 interface on the app-server host.
++    ActivateEl2Control {
++        thread_id: Option<ThreadId>,
++        quiet: bool,
++    },
++    El2ControlActivated {
++        thread_id: Option<ThreadId>,
++        request_id: uuid::Uuid,
++        quiet: bool,
++        result: Result<crate::el2_control::Activation, String>,
++    },
++
+     /// Resolve an inline permission profile after any app-owned platform preflight.
+     ResolvePermissionProfile {
+         profile_id: String,
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__status_line_style__tests__light_status_line_corrects_pale_custom_theme_colors.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__status_line_style__tests__light_status_line_corrects_pale_custom_theme_colors.snap
+index 4312950986117aff57573be99d32585ac5e16cbb..87da9c50987ccd1724deb6784472c06d3c9d2271 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__status_line_style__tests__light_status_line_corrects_pale_custom_theme_colors.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__status_line_style__tests__light_status_line_corrects_pale_custom_theme_colors.snap
+@@ -13,7 +13,6 @@ Buffer {
+         x: 5, y: 0, fg: Rgb(118, 118, 118), bg: Reset, underline: Reset, modifier: NONE,
+         x: 8, y: 0, fg: Rgb(105, 123, 100), bg: Reset, underline: Reset, modifier: NONE,
+         x: 14, y: 0, fg: Rgb(118, 118, 118), bg: Reset, underline: Reset, modifier: NONE,
+-        x: 17, y: 0, fg: Rgb(129, 111, 143), bg: Reset, underline: Reset, modifier: NONE,
+         x: 35, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+     ]
+ }
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 2efa1a07db3a2694d3c2e4ace79f2e5d3cc80d6f..3e0afa20c39575a422f3ad3e3924e60d76f9bd0c 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -6,11 +6,14 @@ use ratatui::style::Styled;
+ use ratatui::text::Span;
+ 
+ use super::status_line_setup::StatusLineItem;
++use crate::color::is_light;
+ use crate::render::highlight::foreground_style_for_scopes;
+ use crate::style::readable_color_on;
+ use crate::style::secondary_text_style;
+ use crate::terminal_hyperlinks::HyperlinkLine;
+ use crate::terminal_palette::StdoutColorLevel;
++use crate::terminal_palette::best_color;
++use crate::terminal_palette::default_bg;
+ use crate::terminal_palette::effective_stdout_color_level;
+ use crate::thread_color::thread_color;
+ use codex_protocol::ThreadId;
+@@ -149,6 +152,8 @@ where
+             && let Some(thread_id) = thread_id
+         {
+             Style::default().fg(thread_color(thread_id))
++        } else if use_theme_colors && item == StatusLineItem::Permissions {
++            permissions_status_line_style(&text)
+         } else if use_theme_colors {
+             let accent = StatusLineAccent::for_item(item);
+             soften_status_line_style(
+@@ -180,6 +185,32 @@ where
+     (!line.line.spans.is_empty()).then_some(line)
+ }
+ 
++fn permissions_status_line_style(text: &str) -> Style {
++    if text == crate::el2_control::LABEL {
++        let foreground = match effective_stdout_color_level() {
++            StdoutColorLevel::Ansi16 => Color::LightRed,
++            _ => best_color((255, 95, 109)),
++        };
++        return Style::default().fg(foreground);
++    }
++
++    if text != "Full Access" {
++        return secondary_text_style();
++    }
++
++    // Match the app's permission trigger: Full Access uses text-warning,
++    // orange-300 (#ff8549) on dark backgrounds and orange-500 (#e25507) on light.
++    // Other permission labels are neutral, not syntax-theme accents.
++    let light = default_bg().is_some_and(is_light);
++    let warning = if light { (226, 85, 7) } else { (255, 133, 73) };
++    let foreground = match effective_stdout_color_level() {
++        StdoutColorLevel::Ansi16 if light => Color::Red,
++        StdoutColorLevel::Ansi16 => Color::Yellow,
++        _ => best_color(warning),
++    };
++    Style::default().fg(foreground)
++}
++
+ fn soften_status_line_style(mut style: Style) -> Style {
+     if let Some(fg) = style.fg {
+         style.fg = Some(soften_status_line_color(fg));
+@@ -367,6 +398,84 @@ mod tests {
+         assert_eq!(line.spans[2].style, secondary_text_style());
+     }
+ 
++    #[test]
++    fn permissions_match_the_app_instead_of_the_syntax_theme() {
++        let colors = crate::terminal_probe::DefaultColors {
++            fg: (222, 222, 222),
++            bg: (0, 0, 0),
++        };
++        crate::terminal_palette::with_test_default_colors(colors, || {
++            let line = status_line_from_segments_with_resolver(
++                [
++                    (StatusLineItem::ModelName, "gpt-5".to_string()),
++                    (StatusLineItem::Permissions, "Full Access".to_string()),
++                    (StatusLineItem::Permissions, "Workspace".to_string()),
++                    (StatusLineItem::Permissions, "Read Only".to_string()),
++                    (
++                        StatusLineItem::Permissions,
++                        "Custom permissions".to_string(),
++                    ),
++                    (StatusLineItem::Permissions, "my-profile".to_string()),
++                ],
++                /*use_theme_colors*/ true,
++                /*thread_id*/ None,
++                |_| Some(Style::default().magenta()),
++            )
++            .expect("status line");
++
++            assert_eq!(line.spans[0].style.fg, Some(Color::Magenta));
++            assert_eq!(
++                line.spans[2].style.fg,
++                Some(crate::terminal_palette::rgb_color((255, 133, 73)))
++            );
++            for index in [4, 6, 8, 10] {
++                assert_eq!(line.spans[index].style, secondary_text_style());
++            }
++            assert_eq!(
++                line_text(&line),
++                "gpt-5 · Full Access · Workspace · Read Only · Custom permissions · my-profile"
++            );
++        });
++    }
++
++    #[test]
++    fn permissions_warning_adapts_to_light_backgrounds() {
++        let colors = crate::terminal_probe::DefaultColors {
++            fg: (30, 30, 30),
++            bg: (255, 255, 255),
++        };
++        crate::terminal_palette::with_test_default_colors(colors, || {
++            let line = status_line_from_segments_with_resolver(
++                [(StatusLineItem::Permissions, "Full Access".to_string())],
++                /*use_theme_colors*/ true,
++                /*thread_id*/ None,
++                |_| panic!("permission colors must not use the syntax theme"),
++            )
++            .expect("status line");
++
++            assert_eq!(
++                line.spans[0].style.fg,
++                Some(readable_color_on(
++                    crate::terminal_palette::rgb_color((226, 85, 7)),
++                    /*background*/ None
++                ))
++            );
++        });
++    }
++
++    #[test]
++    fn permissions_respect_the_monochrome_toggle() {
++        let line = status_line_from_segments_with_resolver(
++            [(StatusLineItem::Permissions, "Full Access".to_string())],
++            /*use_theme_colors*/ false,
++            /*thread_id*/ None,
++            |_| panic!("monochrome status lines must not use theme colors"),
++        )
++        .expect("status line");
++
++        assert_eq!(line.spans[0].style, secondary_text_style());
++    }
++
+     #[test]
+     fn pull_request_number_uses_link_style() {
+         let line = status_line_from_segments_with_resolver(
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index d03fa8f3c2825c92ceaf12af271514fb5a873cc4..bf97946db9488051227ef230f5863f9da285fe92 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -334,6 +334,7 @@ pub(crate) mod quick_dials;
+ mod session_model_selection;
+ use self::notifications::Notification;
+ pub(crate) use self::session_model_selection::AstraModelPickerAction;
++mod el2_control;
+ mod permission_discovery;
+ mod permission_popups;
+ mod permission_shortcuts;
+@@ -529,6 +530,8 @@ pub(crate) struct ChatWidget {
+     pub(crate) empty_state_animation:
+         std::cell::RefCell<crate::empty_state_animation::EmptyStateAnimation>,
+     pub(crate) daybreak_enabled: bool,
++    el2_control_enabled: bool,
++    el2_control_request_id: Option<uuid::Uuid>,
+     app_event_tx: AppEventSender,
+     codex_op_target: CodexOpTarget,
+     bottom_pane: BottomPane,
+diff --git a/codex-rs/tui/src/chatwidget/backend_banners.rs b/codex-rs/tui/src/chatwidget/backend_banners.rs
+index e769319de7d8bb2e1dc4ab6cc9d71675c739bc48..9333fd5d4ea163fdef0243a66ec065a0d73638da 100644
+--- a/codex-rs/tui/src/chatwidget/backend_banners.rs
++++ b/codex-rs/tui/src/chatwidget/backend_banners.rs
+@@ -8,6 +8,7 @@
+ use super::ChatWidget;
+ use super::QueuedUserMessage;
+ use super::luna_reserve_return::ReserveReturnModel;
++use super::user_message_for_restore;
+ use crate::app_command::AppCommand;
+ use crate::backend_banners::BackendBanner;
+ use crate::backend_banners::BannerPresentation;
+@@ -19,6 +20,7 @@ use crate::bottom_pane::popup_consts::accept_cancel_hint_line;
+ use crate::keymap::ListAction;
+ use crate::model_catalog::LUNA_RESERVE_MODEL;
+ use codex_app_server_protocol::GetAccountRateLimitsResponse;
++use codex_features::Feature;
+ use codex_protocol::config_types::CollaborationMode;
+ use codex_protocol::config_types::ModeKind;
+ use codex_protocol::openai_models::ModelPreset;
+@@ -59,7 +61,7 @@ pub(super) struct BackendBannerState {
+ }
+ 
+ impl ChatWidget {
+-    pub(super) fn restrict_model_picker_to_luna_reserve(&self) -> bool {
++    pub(crate) fn restrict_model_picker_to_luna_reserve(&self) -> bool {
+         // A fresh account read can allow manual recovery even without a valid saved return model.
+         self.current_model() == LUNA_RESERVE_MODEL
+             && !self.backend_banner_state.ordinary_usage_recovered
+@@ -216,6 +218,29 @@ impl ChatWidget {
+         if !self.waiting_for_luna_reserve() {
+             return false;
+         }
++        if self.config.features.enabled(Feature::SteerOnly) {
++            if let Some(prompt) = self.safety_buffering_prompt.take() {
++                self.finalize_turn();
++                self.restore_user_message_to_composer(prompt);
++            }
++            let pending = self
++                .input_queue
++                .pending_steers
++                .drain(..)
++                .collect::<Vec<_>>();
++            for steer in pending.into_iter().rev() {
++                self.restore_user_message_to_composer(user_message_for_restore(
++                    steer.user_message,
++                    &steer.history_record,
++                ));
++            }
++            self.refresh_pending_input_preview();
++            self.add_error_message(
++                "Cannot send during model recovery. Your message remains unsent in the composer."
++                    .to_string(),
++            );
++            return true;
++        }
+         if self.input_queue.user_turn_pending_start
+             && let Some(prompt) = self.safety_buffering_prompt.take()
+         {
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 9d1d4fa6f5ba93bcf45981b7d1ea467059f43398..e7f1338fe82135a6caf6e94ba81e0440e5d348d6 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -102,9 +102,14 @@ impl ChatWidget {
+             pet_http_client.clone(),
+         );
+         let config_panel_tui = local_settings.tui.clone();
++        let el2_control_enabled = cfg!(target_os = "linux")
++            && config.permissions.effective_permission_profile() == PermissionProfile::Disabled
++            && crate::el2_control::default_selected(&config.codex_home);
+         let mut widget = Self {
+             empty_state_animation: std::cell::RefCell::new(empty_state_animation),
+             daybreak_enabled: false,
++            el2_control_enabled,
++            el2_control_request_id: None,
+             app_event_tx: app_event_tx.clone(),
+             frame_requester: frame_requester.clone(),
+             codex_op_target,
+diff --git a/codex-rs/tui/src/chatwidget/el2_control.rs b/codex-rs/tui/src/chatwidget/el2_control.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba13d978199e008b98bb51ccd0667734175be8ea
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/el2_control.rs
+@@ -0,0 +1,89 @@
++//! EL2 is a selected local capability, layered over the server's Full Access profile.
++
++use super::*;
++
++impl ChatWidget {
++    pub(crate) fn el2_control_is_active(&self) -> bool {
++        self.el2_control_enabled
++            && self.config.permissions.effective_permission_profile() == PermissionProfile::Disabled
++    }
++
++    pub(super) fn el2_control_selection_item(
++        &self,
++        disabled_reason: Option<String>,
++    ) -> Option<SelectionItem> {
++        if !cfg!(target_os = "linux") {
++            return None;
++        }
++        let thread_id = self.thread_id;
++        Some(SelectionItem {
++            name: crate::el2_control::LABEL.to_string(),
++            description: Some("Enable kernel and CPU control on this Linux computer".into()),
++            is_current: self.el2_control_is_active(),
++            disabled_reason: disabled_reason.or_else(|| {
++                thread_id
++                    .is_none()
++                    .then(|| "Wait for this task to connect.".to_string())
++            }),
++            actions: vec![Box::new(move |tx| {
++                tx.send(AppEvent::ActivateEl2Control {
++                    thread_id,
++                    quiet: false,
++                });
++            })],
++            dismiss_on_select: true,
++            ..Default::default()
++        })
++    }
++
++    pub(crate) fn clear_el2_control_selection(&mut self) {
++        self.el2_control_enabled = false;
++        self.el2_control_request_id = None;
++        if let Some(thread_id) = self.thread_id {
++            crate::el2_control::clear(&self.config.codex_home, thread_id);
++        }
++        self.refresh_status_surfaces();
++    }
++
++    pub(crate) fn begin_el2_control_activation(&mut self) -> Option<uuid::Uuid> {
++        if self.el2_control_request_id.is_some() {
++            return None;
++        }
++        let request_id = uuid::Uuid::new_v4();
++        self.el2_control_request_id = Some(request_id);
++        Some(request_id)
++    }
++
++    pub(crate) fn finish_el2_control_activation(&mut self, request_id: uuid::Uuid) -> bool {
++        if self.el2_control_request_id != Some(request_id) {
++            return false;
++        }
++        self.el2_control_request_id = None;
++        true
++    }
++
++    pub(crate) fn enable_el2_control_selection(
++        &mut self,
++        activation: &crate::el2_control::Activation,
++    ) {
++        self.el2_control_enabled = true;
++        if let Some(thread_id) = self.thread_id
++            && let Err(error) =
++                crate::el2_control::save(&self.config.codex_home, thread_id, activation)
++        {
++            self.add_error_message(format!(
++                "EL2 Control is available, but its selection could not be saved: {error}"
++            ));
++        }
++        self.refresh_status_surfaces();
++    }
++
++    pub(super) fn restore_el2_control_selection(&mut self) {
++        self.el2_control_enabled = self.config.permissions.effective_permission_profile()
++            == PermissionProfile::Disabled
++            && self
++                .thread_id
++                .is_some_and(|id| crate::el2_control::selected(&self.config.codex_home, id));
++        self.refresh_status_surfaces();
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/input_flow.rs b/codex-rs/tui/src/chatwidget/input_flow.rs
+index 1cbabcbf39a053d67d3dda6fd83ec1f31f76c2ca..6c8db6945b4ebc62dfc7e60d1bb1a7f600198498 100644
+--- a/codex-rs/tui/src/chatwidget/input_flow.rs
++++ b/codex-rs/tui/src/chatwidget/input_flow.rs
+@@ -60,15 +60,18 @@ impl ChatWidget {
+                     return;
+                 }
+                 self.app_event_tx.send(AppEvent::FollowTranscript);
+-                let should_submit_now = self.is_session_configured()
+-                    && !self.is_plan_streaming_in_tui()
+-                    && !self.input_queue.submissions_paused()
+-                    && !self.input_queue.rate_limit_recovery_pending
+-                    && (!self.input_queue.user_turn_pending_start
+-                        || self.turn_lifecycle.agent_turn_running);
++                let steer_only = self.config.features.enabled(Feature::SteerOnly);
++                let should_submit_now = steer_only
++                    || (self.is_session_configured()
++                        && !self.is_plan_streaming_in_tui()
++                        && !self.input_queue.submissions_paused()
++                        && !self.input_queue.rate_limit_recovery_pending
++                        && (!self.input_queue.user_turn_pending_start
++                            || self.turn_lifecycle.agent_turn_running));
+                 if should_submit_now {
+                     if self.only_user_shell_commands_running()
+                         && !user_message.text.starts_with('!')
++                        && !steer_only
+                     {
+                         self.queue_user_message(user_message);
+                         return;
+@@ -181,6 +184,52 @@ impl ChatWidget {
+         if self.has_misalignment_policy_violation() {
+             return false;
+         }
++        if self.config.features.enabled(Feature::SteerOnly) {
++            return match action {
++                QueuedInputAction::ParseSlash => {
++                    self.submit_queued_slash_prompt(QueuedUserMessage {
++                        user_message,
++                        prepared_images: None,
++                        action,
++                        delivery: MessageDelivery::Unsent,
++                        pending_pastes,
++                        source,
++                    });
++                    true
++                }
++                QueuedInputAction::RunShell => {
++                    self.submit_queued_shell_prompt(user_message);
++                    true
++                }
++                QueuedInputAction::Plain | QueuedInputAction::Literal => {
++                    if self.steer_only_submission_is_blocked(&user_message) {
++                        self.restore_unsent_steer_only_submission(user_message, pending_pastes);
++                        return false;
++                    }
++                    // Literal submissions retain collapsed pastes so a hidden `!`
++                    // never becomes a shell command. Expand the payload while
++                    // retaining that literal policy, including if sending is blocked.
++                    let mut user_message = user_message;
++                    (user_message.text, user_message.text_elements) =
++                        crate::bottom_pane::ChatComposer::expand_pending_pastes(
++                            &user_message.text,
++                            user_message.text_elements,
++                            &pending_pastes,
++                        );
++                    self.submit_user_message_with_history_and_shell_escape_policy(
++                        user_message,
++                        UserMessageHistoryRecord::UserMessageText,
++                        if action == QueuedInputAction::Literal {
++                            ShellEscapePolicy::Disallow
++                        } else {
++                            ShellEscapePolicy::Allow
++                        },
++                        source,
++                    )
++                    .0
++                }
++            };
++        }
+         let should_run_now = self.is_session_configured()
+             && !self.is_user_turn_pending_or_running()
+             && !self.input_queue.submissions_paused()
+@@ -248,6 +297,24 @@ impl ChatWidget {
+ 
+     /// If idle and there are queued inputs, submit exactly one to start the next turn.
+     pub(crate) fn maybe_send_next_queued_input(&mut self) -> bool {
++        if self.config.features.enabled(Feature::SteerOnly) {
++            // Old saved input stays editable; enabling steer-only must not launch it later.
++            let mut messages = Vec::new();
++            while let Some((message, history)) = self.pop_next_queued_user_message() {
++                messages.push((
++                    user_message_for_restore(message.user_message, &history),
++                    message.pending_pastes,
++                ));
++            }
++            if !messages.is_empty() {
++                for (message, pending_pastes) in messages.into_iter().rev() {
++                    self.restore_user_message_with_pastes_to_composer(message, pending_pastes);
++                }
++                self.input_queue.recovered_queue = false;
++                self.refresh_pending_input_preview();
++            }
++            return false;
++        }
+         if !self.is_session_configured()
+             || self.fork_in_progress
+             || self.has_misalignment_policy_violation()
+@@ -420,7 +487,8 @@ impl ChatWidget {
+             return;
+         }
+         self.set_collaboration_mask_from_user_action(collaboration_mode);
+-        let should_queue = self.is_plan_streaming_in_tui();
++        let should_queue =
++            !self.config.features.enabled(Feature::SteerOnly) && self.is_plan_streaming_in_tui();
+         let user_message = UserMessage {
+             text,
+             local_images: Vec::new(),
+diff --git a/codex-rs/tui/src/chatwidget/input_restore.rs b/codex-rs/tui/src/chatwidget/input_restore.rs
+index 286566b21bbe5ddd7287c5c39fb7585d56f6fb8c..cb668cb594d7cadcb85e81975147ae90a308be85 100644
+--- a/codex-rs/tui/src/chatwidget/input_restore.rs
++++ b/codex-rs/tui/src/chatwidget/input_restore.rs
+@@ -354,11 +354,46 @@ impl ChatWidget {
+         }
+     }
+ 
+-    pub(super) fn enqueue_rejected_steer(&mut self) -> bool {
++    pub(crate) fn enqueue_rejected_steer(&mut self) -> bool {
+         self.enqueue_rejected_steer_by_id(/*client_id*/ None)
+     }
+ 
+     pub(super) fn enqueue_rejected_steer_by_id(&mut self, client_id: Option<&str>) -> bool {
++        if self.config.features.enabled(Feature::SteerOnly) {
++            // A newly started cloud submission can be rejected by client ID before
++            // it becomes a pending steer. Keep that text visibly unsent, not queued.
++            if let Some(id) = client_id
++                && !self
++                    .input_queue
++                    .pending_steers
++                    .iter()
++                    .any(|pending| pending.client_id == id)
++            {
++                if let Some((message, history, _source)) = self.take_submitted_message(id) {
++                    self.restore_user_message_to_composer(user_message_for_restore(
++                        message, &history,
++                    ));
++                    self.refresh_pending_input_preview();
++                    self.update_task_running_state();
++                    return true;
++                }
++                return false;
++            }
++            if self.input_queue.pending_steers.is_empty() {
++                return false;
++            }
++            if self.input_queue.submit_pending_steers_after_interrupt {
++                return true;
++            }
++            // Reviews and compaction cannot accept input. Interrupt them and reuse the
++            // existing acknowledged-interrupt path to submit these instructions immediately.
++            self.input_queue.submit_pending_steers_after_interrupt = true;
++            if !self.submit_op(AppCommand::interrupt()) {
++                self.input_queue.submit_pending_steers_after_interrupt = false;
++                return false;
++            }
++            return true;
++        }
+         let pending = match client_id {
+             Some(id) => self.take_submitted_message(id),
+             None => self
+@@ -616,8 +651,21 @@ impl ChatWidget {
+     }
+ 
+     pub(crate) fn restore_user_message_to_composer(&mut self, user_message: UserMessage) {
++        self.restore_user_message_with_pastes_to_composer(user_message, Vec::new());
++    }
++
++    pub(super) fn restore_user_message_with_pastes_to_composer(
++        &mut self,
++        user_message: UserMessage,
++        pending_pastes: Vec<(String, String)>,
++    ) {
+         let draft = self.bottom_pane.composer_draft_snapshot();
+-        let pending_pastes = draft.pending_pastes;
++        let mut used_paste_placeholders = HashSet::new();
++        let (user_message, mut pending_pastes) = remap_colliding_paste_placeholders(
++            user_message,
++            pending_pastes,
++            &mut used_paste_placeholders,
++        );
+         let draft_message = UserMessage {
+             text: draft.text,
+             text_elements: draft.text_elements,
+@@ -630,6 +678,12 @@ impl ChatWidget {
+             || !draft_message.local_images.is_empty()
+             || !draft_message.remote_image_urls.is_empty()
+         {
++            let (draft_message, draft_pending_pastes) = remap_colliding_paste_placeholders(
++                draft_message,
++                draft.pending_pastes,
++                &mut used_paste_placeholders,
++            );
++            pending_pastes.extend(draft_pending_pastes);
+             messages.push(draft_message);
+         }
+         self.restore_composer_state(Self::composer_state_from_user_message(
+diff --git a/codex-rs/tui/src/chatwidget/input_submission.rs b/codex-rs/tui/src/chatwidget/input_submission.rs
+index c616326e526289a6fbee63e5eb83bfe31435cb9b..a6d46d349d1d3c1fc2d3fd18704dcf11c08f48ef 100644
+--- a/codex-rs/tui/src/chatwidget/input_submission.rs
++++ b/codex-rs/tui/src/chatwidget/input_submission.rs
+@@ -5,6 +5,29 @@ use codex_app_server_protocol::ImageReference;
+ use codex_utils_path_uri::LegacyAppPathString;
+ 
+ impl ChatWidget {
++    pub(super) fn steer_only_submission_is_blocked(&self, message: &UserMessage) -> bool {
++        self.config.features.enabled(Feature::SteerOnly)
++            && (self.input_queue.rate_limit_recovery_pending
++                || self.input_queue.submissions_paused()
++                || self.pending_image_submission.is_some()
++                || self.safety_recourse.is_some()
++                || !self.is_session_configured()
++                || ((!message.local_images.is_empty() || !message.remote_image_urls.is_empty())
++                    && !self.current_model_supports_images()))
++    }
++
++    pub(super) fn restore_unsent_steer_only_submission(
++        &mut self,
++        message: UserMessage,
++        pending_pastes: Vec<(String, String)>,
++    ) {
++        self.restore_user_message_with_pastes_to_composer(message, pending_pastes);
++        self.add_error_message(
++            "Cannot send yet. Your message remains unsent in the composer; press Enter when ready."
++                .to_string(),
++        );
++    }
++
+     pub(crate) fn set_task_mentions_enabled(&mut self, enabled: bool) {
+         self.bottom_pane.set_task_mentions_enabled(enabled);
+     }
+@@ -161,6 +184,13 @@ impl ChatWidget {
+             return (false, None);
+         }
+         self.empty_state_animation.borrow_mut().dismiss();
++        if self.steer_only_submission_is_blocked(&user_message) {
++            self.restore_unsent_steer_only_submission(
++                user_message_for_restore(user_message, &history_record),
++                Vec::new(),
++            );
++            return (false, None);
++        }
+         if self.input_queue.rate_limit_recovery_pending
+             || self.pending_image_submission.is_some()
+             || self.safety_recourse.is_some()
+diff --git a/codex-rs/tui/src/chatwidget/model_command.rs b/codex-rs/tui/src/chatwidget/model_command.rs
+index a4fa68289650597e5baa2f2bd3e04a7bf6e42609..8a9cc3861b777becb590a68ddb6b4b0f027b7e59 100644
+--- a/codex-rs/tui/src/chatwidget/model_command.rs
++++ b/codex-rs/tui/src/chatwidget/model_command.rs
+@@ -49,6 +49,9 @@ fn resolve_reasoning_effort(
+             model.default_reasoning_effort.clone()
+         });
+     };
++    if effort == ReasoningEffort::Persistent.as_str() {
++        return Ok(ReasoningEffort::Persistent);
++    }
+     let supported = if model.supported_reasoning_efforts.is_empty() {
+         (model.default_reasoning_effort.as_str() == effort)
+             .then_some(&model.default_reasoning_effort)
+diff --git a/codex-rs/tui/src/chatwidget/model_popups.rs b/codex-rs/tui/src/chatwidget/model_popups.rs
+index afaca388677b4c4ab36775e3c731ac21d470bc8e..06ec06d5ab2634fd5594a33ba825456d5be776ba 100644
+--- a/codex-rs/tui/src/chatwidget/model_popups.rs
++++ b/codex-rs/tui/src/chatwidget/model_popups.rs
+@@ -491,9 +491,10 @@ impl ChatWidget {
+ 
+     /// Open a popup to choose the standard reasoning effort for the given model.
+     ///
+-    /// Max and Ultra require an explicit second step so expensive efforts cannot
+-    /// be selected accidentally while moving through the normal effort scale.
+-    pub(crate) fn open_reasoning_popup(&mut self, preset: ModelPreset) {
++    /// Advanced reasoning and persistence require an explicit second step so
++    /// they cannot be selected accidentally while moving through the normal scale.
++    pub(crate) fn open_reasoning_popup(&mut self, mut preset: ModelPreset) {
++        Self::include_persistent_choice(&mut preset);
+         let default_effort = preset.default_reasoning_effort.clone();
+         let supported = &preset.supported_reasoning_efforts;
+         let in_plan_mode =
+@@ -627,7 +628,7 @@ impl ChatWidget {
+                 .iter()
+                 .map(Self::reasoning_effort_label)
+                 .collect::<Vec<_>>()
+-                .join(" and ");
++                .join(", ");
+             let verb = if advanced_choices.len() == 1 {
+                 "consumes"
+             } else {
+@@ -667,8 +668,9 @@ impl ChatWidget {
+         });
+     }
+ 
+-    /// Open the explicit Max/Ultra effort picker for the given model.
+-    pub(crate) fn open_advanced_reasoning_popup(&mut self, preset: ModelPreset) {
++    /// Open the explicit advanced reasoning and persistence picker.
++    pub(crate) fn open_advanced_reasoning_popup(&mut self, mut preset: ModelPreset) {
++        Self::include_persistent_choice(&mut preset);
+         let mut choices = preset
+             .supported_reasoning_efforts
+             .iter()
+@@ -680,7 +682,7 @@ impl ChatWidget {
+         {
+             choices.push(preset.default_reasoning_effort.clone());
+         }
+-        choices.sort_by_key(|effort| matches!(effort, ReasoningEffortConfig::Ultra));
++        choices.sort_by_key(Self::advanced_reasoning_effort_order);
+         if choices.is_empty() {
+             return;
+         }
+@@ -699,7 +701,10 @@ impl ChatWidget {
+                 ReasoningEffortConfig::Ultra => {
+                     "For demanding work using multiple agents · highest usage"
+                 }
+-                _ => unreachable!("advanced choices are limited to Max and Ultra"),
++                ReasoningEffortConfig::Persistent => {
++                    "Keep working and checking results until finished or stopped"
++                }
++                _ => unreachable!("advanced choices are limited to Max, Ultra and Persistent"),
+             };
+             let should_prompt_plan_mode_scope = self
+                 .should_prompt_plan_mode_reasoning_scope(model_slug.as_str(), Some(effort.clone()));
+@@ -737,10 +742,46 @@ impl ChatWidget {
+     pub(super) fn is_advanced_reasoning_effort(effort: &ReasoningEffortConfig) -> bool {
+         matches!(
+             effort,
+-            ReasoningEffortConfig::Max | ReasoningEffortConfig::Ultra
++            ReasoningEffortConfig::Max
++                | ReasoningEffortConfig::Ultra
++                | ReasoningEffortConfig::Persistent
+         )
+     }
+ 
++    pub(super) fn advanced_reasoning_effort_order(effort: &ReasoningEffortConfig) -> u8 {
++        match effort {
++            ReasoningEffortConfig::Max => 0,
++            ReasoningEffortConfig::Ultra => 1,
++            ReasoningEffortConfig::Persistent => 2,
++            _ => 0,
++        }
++    }
++
++    fn include_persistent_choice(preset: &mut ModelPreset) {
++        // Persistence is a local execution mode. Its availability must not depend
++        // on a model advertising a dedicated inference reasoning level.
++        if preset.supported_reasoning_efforts.is_empty() {
++            preset.supported_reasoning_efforts.push(
++                codex_protocol::openai_models::ReasoningEffortPreset {
++                    effort: preset.default_reasoning_effort.clone(),
++                    description: String::new(),
++                },
++            );
++        }
++        if !preset
++            .supported_reasoning_efforts
++            .iter()
++            .any(|option| option.effort == ReasoningEffortConfig::Persistent)
++        {
++            preset.supported_reasoning_efforts.push(
++                codex_protocol::openai_models::ReasoningEffortPreset {
++                    effort: ReasoningEffortConfig::Persistent,
++                    description: "Keep working until finished or stopped".to_string(),
++                },
++            );
++        }
++    }
++
+     pub(super) fn reasoning_effort_label(effort: &ReasoningEffortConfig) -> String {
+         match effort {
+             ReasoningEffortConfig::None => "None".to_string(),
+diff --git a/codex-rs/tui/src/chatwidget/permission_popups.rs b/codex-rs/tui/src/chatwidget/permission_popups.rs
+index a91e85ce9ff848e6e930656b2af7d3d6e7bfff67..ecbace686d9bc28c08e669584369e08ea85c4cc8 100644
+--- a/codex-rs/tui/src/chatwidget/permission_popups.rs
++++ b/codex-rs/tui/src/chatwidget/permission_popups.rs
+@@ -164,6 +164,22 @@ impl ChatWidget {
+             }
+         }
+ 
++        if self.el2_control_is_active() {
++            for item in &mut items {
++                item.is_current = false;
++            }
++        }
++        let full_access_disabled_reason = self
++            .config
++            .permissions
++            .can_set_permission_profile(&PermissionProfile::Disabled)
++            .err()
++            .map(|error| error.to_string());
++        if let Some(item) = self.el2_control_selection_item(full_access_disabled_reason) {
++            items.push(item);
++        }
++        items.reverse();
++
+         let footer_note = show_elevate_sandbox_hint.then(|| {
+             vec![
+                 "The non-admin sandbox protects your files and prevents network access under most circumstances. However, it carries greater risk if prompt injected. To upgrade to the default sandbox, run ".dim(),
+diff --git a/codex-rs/tui/src/chatwidget/permissions_menu.rs b/codex-rs/tui/src/chatwidget/permissions_menu.rs
+index b6614dc81e0a59ca7a322f547bcf8fec0cf83a6f..914043af7d1b37ea8d37ba0ea11f62ab64531534 100644
+--- a/codex-rs/tui/src/chatwidget/permissions_menu.rs
++++ b/codex-rs/tui/src/chatwidget/permissions_menu.rs
+@@ -57,6 +57,32 @@ impl ChatWidget {
+         requested_approval_policy: Option<AskForApproval>,
+         requested_reviewer: Option<ApprovalsReviewer>,
+     ) -> bool {
++        if matches!(
++            profile_id,
++            "el2" | "el2-control" | crate::el2_control::PROFILE_ALIAS
++        ) {
++            if requested_approval_policy.is_some() || requested_reviewer.is_some() {
++                self.add_error_message(
++                    "EL2 Control preserves the current approval settings. Change those separately."
++                        .into(),
++                );
++                return false;
++            }
++            let approval = self.config.permissions.approval_policy.value().into();
++            if let Some(reason) = discovery.disabled_reason(
++                BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
++                Some(approval),
++                Some(self.config.approvals_reviewer.into()),
++            ) {
++                self.add_error_message(format!("EL2 Control is unavailable: {reason}"));
++                return false;
++            }
++            self.app_event_tx.send(AppEvent::ActivateEl2Control {
++                thread_id: self.thread_id,
++                quiet: false,
++            });
++            return true;
++        }
+         let reviewer = match profile_id {
+             ":approve-for-me" if !self.config.features.enabled(Feature::GuardianApproval) => {
+                 self.add_error_message(
+@@ -196,6 +222,7 @@ impl ChatWidget {
+             AskForApproval::from(full_access.approval),
+             ApprovalsReviewer::User,
+         ));
++        items.reverse();
+         items.push(self.builtin_permission_mode_selection_item(
+             &discovery,
+             read_only,
+@@ -204,6 +231,19 @@ impl ChatWidget {
+             AskForApproval::from(read_only.approval),
+             ApprovalsReviewer::User,
+         ));
++        if self.el2_control_is_active() {
++            for item in &mut items {
++                item.is_current = false;
++            }
++        }
++        let el2_disabled_reason = discovery.disabled_reason(
++            BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
++            Some(self.config.permissions.approval_policy.value().into()),
++            Some(self.config.approvals_reviewer.into()),
++        );
++        if let Some(item) = self.el2_control_selection_item(el2_disabled_reason) {
++            items.insert(0, item);
++        }
+         items.extend(
+             discovery
+                 .profiles
+diff --git a/codex-rs/tui/src/chatwidget/realtime_settings.rs b/codex-rs/tui/src/chatwidget/realtime_settings.rs
+index 3b5f6611d3007eacee15b72ebe7fde6b69b5a303..75256bb21ab082d54ed84c0e75481c48ec36165f 100644
+--- a/codex-rs/tui/src/chatwidget/realtime_settings.rs
++++ b/codex-rs/tui/src/chatwidget/realtime_settings.rs
+@@ -58,9 +58,13 @@ impl ChatWidget {
+         current: Option<RealtimeVoice>,
+         voices: RealtimeVoicesList,
+     ) {
+-        // The TUI uses V3, which shares the V1 voice catalog.
+-        let mut items: Vec<SelectionItem> = voices
+-            .v1
++        // Prefer the complete V3 catalog, retaining older servers' V1 fallback.
++        let available = if voices.v3.is_empty() {
++            voices.v1
++        } else {
++            voices.v3
++        };
++        let mut items: Vec<SelectionItem> = available
+             .into_iter()
+             .map(|voice| SelectionItem {
+                 name: voice.wire_name().to_string(),
+diff --git a/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs b/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
+index c55eb1fc23f4038cf5d812e7d6f0655bb2dc1228..e8c792f93d12d839cef271600521553b4108afc8 100644
+--- a/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
++++ b/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
+@@ -117,7 +117,10 @@ impl ChatWidget {
+         };
+ 
+         if direction == ReasoningShortcutDirection::Raise
+-            && next_effort == ReasoningEffortConfig::Ultra
++            && matches!(
++                next_effort,
++                ReasoningEffortConfig::Ultra | ReasoningEffortConfig::Persistent
++            )
+         {
+             let model_path = if current_model.starts_with("codex-auto-") {
+                 current_model
+@@ -125,7 +128,10 @@ impl ChatWidget {
+                 format!("All models → {current_model}")
+             };
+             self.add_info_message(
+-                format!("Ultra is available under /model → {model_path} → More reasoning…"),
++                format!(
++                    "{} is available under /model → {model_path} → More reasoning…",
++                    Self::reasoning_effort_label(&next_effort)
++                ),
+                 /*hint*/ None,
+             );
+             return true;
+@@ -164,7 +170,7 @@ fn reasoning_choices(preset: &ModelPreset) -> Vec<ReasoningEffortConfig> {
+         .iter()
+         .map(|option| option.effort.clone())
+         .partition(|effort| !ChatWidget::is_advanced_reasoning_effort(effort));
+-    advanced_choices.sort_by_key(|effort| matches!(effort, ReasoningEffortConfig::Ultra));
++    advanced_choices.sort_by_key(ChatWidget::advanced_reasoning_effort_order);
+     choices.extend(advanced_choices);
+     if choices.is_empty() {
+         choices.push(preset.default_reasoning_effort.clone());
+diff --git a/codex-rs/tui/src/chatwidget/session_flow.rs b/codex-rs/tui/src/chatwidget/session_flow.rs
+index 3ce1a257435f52809a24419119a18307a6c5b8db..9b832217eddc051406d9fbd379e22db03f96dd0b 100644
+--- a/codex-rs/tui/src/chatwidget/session_flow.rs
++++ b/codex-rs/tui/src/chatwidget/session_flow.rs
+@@ -93,6 +93,10 @@ impl ChatWidget {
+         let connector_scope_changed = previous_thread_id != Some(session.thread_id)
+             || self.config.cwd.as_path() != session.cwd.as_path();
+         self.thread_id = Some(session.thread_id);
++        if previous_thread_id != self.thread_id {
++            self.el2_control_enabled = false;
++            self.el2_control_request_id = None;
++        }
+         self.daybreak_enabled = self.config.features.enabled(Feature::CliDaybreak)
+             && session.daybreak_enabled
+             && !matches!(display, SessionConfiguredDisplay::SideConversation);
+@@ -262,6 +266,9 @@ impl ChatWidget {
+             self.add_info_message("Daybreak is on for new turns.".into(), /*hint*/ None);
+         }
+         self.transcript.saw_copy_source_this_turn = false;
++        if previous_thread_id != self.thread_id {
++            self.restore_el2_control_selection();
++        }
+         self.refresh_skills_for_current_cwd(/*force_reload*/ true);
+         self.refresh_connector_mentions(/*force_refresh*/ false);
+         let initial_user_message_pending = self.initial_user_message.is_some();
+diff --git a/codex-rs/tui/src/chatwidget/settings.rs b/codex-rs/tui/src/chatwidget/settings.rs
+index f6dea221f4682c8cfb43b11512b9b87fdc6dfbd8..d9d4adf74a087e50a3ad0393b75221b4629d1605 100644
+--- a/codex-rs/tui/src/chatwidget/settings.rs
++++ b/codex-rs/tui/src/chatwidget/settings.rs
+@@ -310,6 +310,14 @@ impl ChatWidget {
+ 
+     /// Set the model in the widget's config copy and stored collaboration mode.
+     pub(crate) fn set_model(&mut self, model: &str) {
++        let disable_daybreak = self.daybreak_enabled
++            && crate::daybreak::program_for_turn(
++                &self.model_catalog.models,
++                model,
++                self.daybreak_account_eligible(),
++                /*enabled*/ true,
++            )
++            .is_err();
+         if model != self.current_model() {
+             if self.current_model() == crate::model_catalog::LUNA_RESERVE_MODEL {
+                 self.clear_reserve_return();
+@@ -328,6 +336,13 @@ impl ChatWidget {
+         {
+             mask.model = Some(model.to_string());
+         }
++        if disable_daybreak {
++            self.set_daybreak_enabled(false);
++            if let Some(thread_id) = self.thread_id {
++                self.app_event_tx
++                    .send(AppEvent::DisableDaybreakForModelChange { thread_id });
++            }
++        }
+         self.refresh_effective_service_tier();
+         self.refresh_model_dependent_surfaces();
+     }
+@@ -455,7 +470,7 @@ impl ChatWidget {
+             .unwrap_or(ModeKind::Default)
+     }
+ 
+-    pub(super) fn effective_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
++    pub(crate) fn effective_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
+         if !self.collaboration_modes_enabled() {
+             return self.current_collaboration_mode.reasoning_effort();
+         }
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__advanced_only_reasoning_selection_popup.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__advanced_only_reasoning_selection_popup.snap
+index 56a913b7280e76bb26b3faf5afaa3ed6279be0f7..624e41d9d1198b369d0a5f94f018c6c11490a0f0 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__advanced_only_reasoning_selection_popup.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__advanced_only_reasoning_selection_popup.snap
+@@ -5,6 +5,6 @@ expression: popup
+   Select Reasoning Level for GPT-5.5
+ 
+ 
+-› 1. More reasoning…  Ultra consumes usage limits faster
++› 1. More reasoning…  Ultra, Persistent consume usage limits faster
+ 
+   enter select · esc back
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__custom_model_display_name_reasoning.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__custom_model_display_name_reasoning.snap
+index eecbf6e49d8307df148977ae474e24b56b76dbb5..7e1af4f62b6ade0b1db6110d323c10094415e205 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__custom_model_display_name_reasoning.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__custom_model_display_name_reasoning.snap
+@@ -8,5 +8,6 @@ expression: "render_bottom_popup(&chat, 80)"
+ 
+   1. Low                       Quick answers
+ › 2. High (default) (current)  Deeper reasoning
++  3. More reasoning…           Persistent consumes usage limits faster
+ 
+   enter default · s session · esc back
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__model_advanced_reasoning_selection_popup.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__model_advanced_reasoning_selection_popup.snap
+index 3dea3eae4f2b046495f0435f87a25973cb92d0f2..375eaf57af1e2124889d617d320139f2da2822b0 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__model_advanced_reasoning_selection_popup.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__model_advanced_reasoning_selection_popup.snap
+@@ -9,5 +9,7 @@ expression: popup
+   1. Max              For difficult problems when quality matters more than
+                       speed · higher usage
+ › 2. Ultra (current)  For demanding work using multiple agents · highest usage
++  3. Persistent       Keep working and checking results until finished or
++                      stopped
+ 
+   enter apply · s session · esc back
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__model_reasoning_selection_popup.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__model_reasoning_selection_popup.snap
+index 4c0488b4ae6d86f6fe0b1914616c4ac5dd98bc38..bdd779bbe34040826635863ec1e956e269ebb734 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__model_reasoning_selection_popup.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__model_reasoning_selection_popup.snap
+@@ -9,7 +9,6 @@ expression: popup
+   2. Medium (default)  Balances speed and reasoning depth for everyday tasks
+ › 3. High (current)    Greater reasoning depth for complex problems
+   4. Extra high        Extra high reasoning depth for complex problems
+-  5. Persistent        Continue working until put to sleep
+-  6. More reasoning…   Max and Ultra consume usage limits faster
++  5. More reasoning…   Max, Ultra, Persistent consume usage limits faster
+ 
+   enter default · s session · esc back
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 00822bd49480acb20c482d064574542985eb2182..2f4d57b3a27ebe6ad05a07706df2baaa18de8c72 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -762,7 +762,11 @@ impl ChatWidget {
+                     }
+                 }),
+             StatusLineItem::Status => Some(self.run_state_status_text()),
+-            StatusLineItem::Permissions => Some(permissions_display(&self.config)),
++            StatusLineItem::Permissions => Some(if self.el2_control_is_active() {
++                crate::el2_control::LABEL.to_string()
++            } else {
++                permissions_display(&self.config)
++            }),
+             StatusLineItem::ApprovalMode => Some(approval_mode_display(&self.config)),
+             StatusLineItem::UsedTokens => {
+                 let usage = self.status_line_total_usage();
+diff --git a/codex-rs/tui/src/chatwidget/tests.rs b/codex-rs/tui/src/chatwidget/tests.rs
+index 42f292b52b0af893e7b1621b7e164b2db1b4fbbe..cadb0437179dc7cdf266b45b2bd4701051303b21 100644
+--- a/codex-rs/tui/src/chatwidget/tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests.rs
+@@ -247,6 +247,8 @@ mod config_errors;
+ mod copy_export_picker_tests;
+ #[path = "tests/dynamic_activity_tests.rs"]
+ mod dynamic_activity_tests;
++#[cfg(target_os = "linux")]
++mod el2_control;
+ mod exec_flow;
+ mod goal_menu;
+ mod goal_validation;
+@@ -335,3 +337,5 @@ mod security_setup_tests;
+ 
+ #[path = "tests/quick_dials_tests.rs"]
+ mod quick_dials_tests;
++
++mod steer_only;
+diff --git a/codex-rs/tui/src/chatwidget/tests/el2_control.rs b/codex-rs/tui/src/chatwidget/tests/el2_control.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cbeab010b07adff52932eeb36adb97b59602052
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/tests/el2_control.rs
+@@ -0,0 +1,58 @@
++use super::*;
++use crate::permission_discovery::PermissionDiscovery;
++use codex_protocol::models::ActivePermissionProfile;
++
++#[tokio::test]
++async fn picker_requests_real_activation_on_its_original_thread() {
++    let (mut chat, mut events, _ops) = make_chatwidget_manual(None).await;
++    let thread_id = ThreadId::new();
++    chat.thread_id = Some(thread_id);
++    let item = chat.el2_control_selection_item(None).unwrap();
++    assert_eq!(item.name, "EL2 Control");
++    assert!(!item.is_current);
++    item.actions[0](&chat.app_event_tx);
++    assert!(
++        matches!(events.try_recv(), Ok(AppEvent::ActivateEl2Control {
++        thread_id: Some(id), quiet: false,
++    }) if id == thread_id)
++    );
++}
++
++#[tokio::test]
++async fn inline_alias_requests_activation_instead_of_an_unknown_server_profile() {
++    let (mut chat, mut events, _ops) = make_chatwidget_manual(None).await;
++    chat.thread_id = Some(ThreadId::new());
++    let discovery = PermissionDiscovery::local(&chat.config);
++    assert!(chat.try_select_permission_profile(&discovery, "el2-control", None, None));
++    assert!(matches!(
++        events.try_recv(),
++        Ok(AppEvent::ActivateEl2Control { quiet: false, .. })
++    ));
++}
++
++#[tokio::test]
++async fn stale_activation_cannot_override_a_later_permission_choice() {
++    let (mut chat, _events, _ops) = make_chatwidget_manual(None).await;
++    let request_id = chat.begin_el2_control_activation().unwrap();
++    chat.clear_el2_control_selection();
++    assert!(!chat.finish_el2_control_activation(request_id));
++    assert!(!chat.el2_control_is_active());
++}
++
++#[tokio::test]
++async fn active_label_requires_both_activation_and_full_access() {
++    let (mut chat, _events, _ops) = make_chatwidget_manual(None).await;
++    chat.set_permission_profile_from_session_snapshot(PermissionProfileSnapshot::active(
++        PermissionProfile::workspace_write(),
++        ActivePermissionProfile::new(":workspace"),
++    ))
++    .unwrap();
++    chat.el2_control_enabled = true;
++    assert!(!chat.el2_control_is_active());
++    chat.set_permission_profile_from_session_snapshot(PermissionProfileSnapshot::active(
++        PermissionProfile::Disabled,
++        ActivePermissionProfile::new(":danger-full-access"),
++    ))
++    .unwrap();
++    assert!(chat.el2_control_is_active());
++}
+diff --git a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
+index 6a5d4e044faed97df1ccb5409a13fe76e361cec3..7c588341d9402054bba2b50b5f3fb3225496fe3a 100644
+--- a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
++++ b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
+@@ -3791,6 +3791,44 @@ async fn model_advanced_reasoning_selection_popup_snapshot() {
+     assert_chatwidget_snapshot!("model_advanced_reasoning_selection_popup", popup);
+ }
+ 
++#[tokio::test]
++async fn persistent_reasoning_selection_without_catalog_support() {
++    for session_only in [false, true] {
++        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
++        chat.thread_id = Some(ThreadId::new());
++        let mut preset = get_available_model(&chat, "gpt-5.5");
++        preset
++            .supported_reasoning_efforts
++            .retain(|option| option.effort != ReasoningEffortConfig::Persistent);
++        chat.open_advanced_reasoning_popup(preset);
++        let popup = render_bottom_popup(&chat, /*width*/ 100);
++        assert_eq!(popup.matches("Persistent").count(), 1, "{popup}");
++        while rx.try_recv().is_ok() {}
++        chat.handle_key_event(KeyCode::End.into());
++        chat.handle_key_event(if session_only {
++            KeyCode::Char('s').into()
++        } else {
++            KeyCode::Enter.into()
++        });
++        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
++        assert!(
++            events.iter().any(|event| match event {
++                AppEvent::SelectSessionModel {
++                    effort: Some(ReasoningEffortConfig::Persistent),
++                    ..
++                } => session_only,
++                AppEvent::ApplyModelSelection {
++                    effort: Some(ReasoningEffortConfig::Persistent),
++                    ..
++                } => !session_only,
++                _ => false,
++            }),
++            "{events:?}"
++        );
++        assert!(chat.bottom_pane.no_modal_or_popup_active());
++    }
++}
++
+ #[tokio::test]
+ async fn model_reasoning_selection_popup_applies_custom_effort() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+@@ -4213,7 +4251,7 @@ async fn reasoning_popup_shows_extra_high_with_space() {
+ }
+ 
+ #[tokio::test]
+-async fn single_reasoning_option_skips_selection() {
++async fn single_inference_reasoning_option_still_offers_persistence() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+ 
+     let single_effort = vec![ReasoningEffortPreset {
+@@ -4245,8 +4283,8 @@ async fn single_reasoning_option_skips_selection() {
+ 
+     let popup = render_bottom_popup(&chat, /*width*/ 80);
+     assert!(
+-        !popup.contains("Select Reasoning Level"),
+-        "expected reasoning selection popup to be skipped"
++        popup.contains("Select Reasoning Level") && popup.contains("More reasoning"),
++        "expected the local persistence choice to remain available: {popup}"
+     );
+ 
+     let mut events = Vec::new();
+@@ -4257,8 +4295,8 @@ async fn single_reasoning_option_skips_selection() {
+     assert!(
+         events
+             .iter()
+-            .any(|ev| matches!(ev, AppEvent::ApplyModelSelection { effort: Some(effort), .. } if *effort == ReasoningEffortConfig::High)),
+-        "expected reasoning effort to be applied automatically; events: {events:?}"
++            .all(|ev| !matches!(ev, AppEvent::ApplyModelSelection { .. })),
++        "expected explicit selection before changing the effort; events: {events:?}"
+     );
+ }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/tests/steer_only.rs b/codex-rs/tui/src/chatwidget/tests/steer_only.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1a16bac0956429824bf5325425db449e5982f79
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/tests/steer_only.rs
+@@ -0,0 +1,63 @@
++use super::*;
++
++#[tokio::test]
++async fn long_literal_paste_submits_full_text_without_running_a_shell() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.set_feature_enabled(Feature::SteerOnly, true);
++    let payload = format!("!AUDIT_LITERAL_PASTE_{}", "x".repeat(4096));
++    chat.handle_paste(payload.clone());
++    assert!(chat.bottom_pane.composer_text().contains("[Pasted Content"));
++    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++
++    let Op::UserTurn { items, .. } = next_submit_op(&mut op_rx) else {
++        panic!("literal paste must submit a model turn, not a shell command");
++    };
++    assert!(items.iter().any(|item| {
++        matches!(item, codex_app_server_protocol::UserInput::Text { text, .. } if text == &payload)
++    }));
++    assert!(chat.input_queue.queued_user_messages.is_empty());
++}
++
++#[tokio::test]
++async fn blocked_literal_paste_remains_editable_and_retries_with_full_text() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.set_feature_enabled(Feature::SteerOnly, true);
++    chat.input_queue.rate_limit_recovery_pending = true;
++    let payload = format!("!AUDIT_LITERAL_PASTE_{}", "x".repeat(4096));
++    chat.handle_paste(payload.clone());
++    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++
++    assert!(chat.bottom_pane.composer_text().contains("[Pasted Content"));
++    assert!(
++        chat.bottom_pane
++            .composer_pending_pastes()
++            .iter()
++            .any(|(_, text)| text == &payload)
++    );
++    assert!(chat.input_queue.queued_user_messages.is_empty());
++    chat.input_queue.rate_limit_recovery_pending = false;
++    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++    let Op::UserTurn { items, .. } = next_submit_op(&mut op_rx) else {
++        panic!("retry must preserve literal submission");
++    };
++    assert!(items.iter().any(|item| {
++        matches!(item, codex_app_server_protocol::UserInput::Text { text, .. } if text == &payload)
++    }));
++}
++
++#[tokio::test]
++async fn rejected_start_by_client_id_restores_visible_unsent_text() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
++    chat.set_feature_enabled(Feature::SteerOnly, true);
++    chat.input_queue.pending_user_message_client_id = Some("rejected-start".to_owned());
++    chat.input_queue.user_turn_pending_start = true;
++    chat.safety_buffering_prompt = Some(UserMessage::from("keep this visibly unsent"));
++
++    assert!(chat.enqueue_rejected_steer_by_id(Some("rejected-start")));
++    assert_eq!(chat.bottom_pane.composer_text(), "keep this visibly unsent");
++    assert!(chat.input_queue.queued_user_messages.is_empty());
++    assert!(chat.input_queue.rejected_steers_queue.is_empty());
++    assert!(!chat.input_queue.user_turn_pending_start);
++}
+diff --git a/codex-rs/tui/src/el2_control.rs b/codex-rs/tui/src/el2_control.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..968bc0339dee13a1741fae8906554fd15e4aa37c
+--- /dev/null
++++ b/codex-rs/tui/src/el2_control.rs
+@@ -0,0 +1,205 @@
++//! Owner EL2 activation runs on the app-server host, where agent commands execute.
++
++use codex_app_server_client::AppServerRequestHandle;
++use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::CommandExecParams;
++use codex_app_server_protocol::CommandExecResponse;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::SandboxPolicy;
++use codex_protocol::ThreadId;
++use serde::Deserialize;
++use serde::Serialize;
++use std::path::Path;
++use std::path::PathBuf;
++use std::time::Duration;
++
++pub(crate) const LABEL: &str = "EL2 Control";
++pub(crate) const PROFILE_ALIAS: &str = ":el2-control";
++
++#[derive(Clone, Debug, Deserialize, Serialize)]
++pub(crate) struct Activation {
++    pub(crate) exception_level: u32,
++    pub(crate) native_execution_verified: bool,
++    pub(crate) kernel_release: String,
++    pub(crate) boot_id: String,
++}
++
++pub(crate) fn parse_activation(response: CommandExecResponse) -> Result<Activation, String> {
++    if response.exit_code != 0 {
++        let detail = response.stderr.trim();
++        return Err(if detail.is_empty() {
++            format!("EL2 activation exited with status {}", response.exit_code)
++        } else {
++            detail.chars().take(600).collect()
++        });
++    }
++    let activation: Activation = serde_json::from_str(&response.stdout)
++        .map_err(|error| format!("Invalid EL2 activation response: {error}"))?;
++    if activation.exception_level != 2 || !activation.native_execution_verified {
++        return Err("The interface did not confirm native execution at EL2.".to_string());
++    }
++    Ok(activation)
++}
++
++pub(crate) async fn activate(
++    handle: AppServerRequestHandle,
++    cwd: PathBuf,
++) -> Result<Activation, String> {
++    let request = ClientRequest::OneOffCommandExec {
++        request_id: RequestId::String(format!("owner-el2-{}", uuid::Uuid::new_v4())),
++        params: CommandExecParams {
++            command: vec!["/usr/local/bin/el2-control".into(), "activate".into()],
++            process_id: None,
++            tty: false,
++            stream_stdin: false,
++            stream_stdout_stderr: false,
++            output_bytes_cap: Some(16_384),
++            disable_output_cap: false,
++            disable_timeout: false,
++            timeout_ms: Some(25_000),
++            cwd: Some(cwd),
++            env: None,
++            size: None,
++            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
++            permission_profile: None,
++        },
++    };
++    let response: CommandExecResponse =
++        tokio::time::timeout(Duration::from_secs(30), handle.request_typed(request))
++            .await
++            .map_err(|_| "EL2 activation timed out.".to_string())?
++            .map_err(|error| error.to_string())?;
++    parse_activation(response)
++}
++
++fn selection_path(codex_home: &Path, thread_id: ThreadId) -> PathBuf {
++    codex_home
++        .join("state/owner-el2-selection")
++        .join(format!("{thread_id}.json"))
++}
++
++pub(crate) fn default_selected(codex_home: &Path) -> bool {
++    #[derive(Deserialize)]
++    struct DefaultSelection {
++        enabled: bool,
++    }
++    std::fs::read(codex_home.join("state/owner-el2-selection/default.json"))
++        .ok()
++        .and_then(|bytes| serde_json::from_slice::<DefaultSelection>(&bytes).ok())
++        .is_some_and(|selection| selection.enabled)
++}
++
++pub(crate) fn selected(codex_home: &Path, thread_id: ThreadId) -> bool {
++    match std::fs::read(selection_path(codex_home, thread_id)) {
++        Ok(bytes) => serde_json::from_slice::<Activation>(&bytes)
++            .ok()
++            .is_some_and(|activation| {
++                activation.exception_level == 2 && activation.native_execution_verified
++            }),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => default_selected(codex_home),
++        Err(_) => false,
++    }
++}
++
++pub(crate) fn save(
++    codex_home: &Path,
++    thread_id: ThreadId,
++    activation: &Activation,
++) -> std::io::Result<()> {
++    write_selection(codex_home, thread_id, &serde_json::to_vec(activation)?)
++}
++
++fn write_selection(codex_home: &Path, thread_id: ThreadId, bytes: &[u8]) -> std::io::Result<()> {
++    use std::io::Write;
++    let destination = selection_path(codex_home, thread_id);
++    let parent = destination.parent().expect("selection path has a parent");
++    std::fs::create_dir_all(parent)?;
++    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
++    temporary.write_all(bytes)?;
++    temporary
++        .persist(destination)
++        .map_err(|error| error.error)?;
++    Ok(())
++}
++
++pub(crate) fn clear(codex_home: &Path, thread_id: ThreadId) {
++    // Keep an explicit opt-out so resuming this thread does not reapply the default.
++    let _ = write_selection(codex_home, thread_id, br#"{"enabled":false}"#);
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn response(level: u32, verified: bool) -> CommandExecResponse {
++        CommandExecResponse {
++            exit_code: 0,
++            stdout: serde_json::json!({
++                "exception_level": level, "native_execution_verified": verified,
++                "kernel_release": "test-kernel", "boot_id": "test-boot",
++            })
++            .to_string(),
++            stderr: String::new(),
++        }
++    }
++
++    #[test]
++    fn activation_requires_both_el2_and_native_execution() {
++        assert!(parse_activation(response(2, true)).is_ok());
++        assert!(parse_activation(response(1, true)).is_err());
++        assert!(parse_activation(response(2, false)).is_err());
++        let mut failed = response(2, true);
++        failed.exit_code = 1;
++        assert!(parse_activation(failed).is_err());
++    }
++
++    #[test]
++    fn remembered_selection_is_per_thread_and_can_be_cleared() {
++        let directory = tempfile::tempdir().unwrap();
++        let first = ThreadId::new();
++        let second = ThreadId::new();
++        let activation = parse_activation(response(2, true)).unwrap();
++        save(directory.path(), first, &activation).unwrap();
++        assert!(selected(directory.path(), first));
++        assert!(!selected(directory.path(), second));
++        clear(directory.path(), first);
++        assert!(!selected(directory.path(), first));
++    }
++
++    #[test]
++    fn global_default_respects_thread_opt_out_and_explicit_reactivation() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory
++            .path()
++            .join("state/owner-el2-selection/default.json");
++        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
++        std::fs::write(&path, br#"{"enabled":true}"#).unwrap();
++        let first = ThreadId::new();
++        let second = ThreadId::new();
++        assert!(selected(directory.path(), first));
++        clear(directory.path(), first);
++        assert!(!selected(directory.path(), first));
++        assert!(selected(directory.path(), second));
++        let activation = parse_activation(response(2, true)).unwrap();
++        save(directory.path(), first, &activation).unwrap();
++        assert!(selected(directory.path(), first));
++        std::fs::write(&path, br#"{"enabled":false}"#).unwrap();
++        assert!(selected(directory.path(), first));
++        assert!(!selected(directory.path(), second));
++    }
++
++    #[test]
++    fn invalid_default_or_thread_marker_does_not_select_el2() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory
++            .path()
++            .join("state/owner-el2-selection/default.json");
++        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
++        let thread_id = ThreadId::new();
++        std::fs::write(&path, b"invalid").unwrap();
++        assert!(!selected(directory.path(), thread_id));
++        std::fs::write(&path, br#"{"enabled":true}"#).unwrap();
++        std::fs::write(selection_path(directory.path(), thread_id), b"invalid").unwrap();
++        assert!(!selected(directory.path(), thread_id));
++    }
++}
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 115f0835c2c07a8dfb09e412d5d07dab8c4fbb9c..ff71b1708ff2372b469b4c77a6fd45195d3208c0 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -135,6 +135,7 @@ mod config_update;
+ mod copy_input_guard;
+ pub(crate) mod custom_terminal;
+ mod daybreak;
++mod el2_control;
+ mod experimental_features;
+ mod markdown_copy;
+ mod permission_discovery;
+diff --git a/codex-rs/tui/src/security_setup.rs b/codex-rs/tui/src/security_setup.rs
+index 5c7ce789691266ea02a809769c631e917372d0fc..3157bb9d452468244137b3673d47844b7776065b 100644
+--- a/codex-rs/tui/src/security_setup.rs
++++ b/codex-rs/tui/src/security_setup.rs
+@@ -66,6 +66,18 @@ pub(crate) fn prefetch(
+     tx: AppEventSender,
+     request_id: Uuid,
+ ) {
++    // Keep the terminal's optional reminder preference in the native frontend.
++    // The existing opt-in and disabled marker restore the standard reminder.
++    if std::env::var_os("CODEX_SECURITY_SETUP_REMINDERS").as_deref()
++        != Some(std::ffi::OsStr::new("1"))
++        && !config
++            .codex_home
++            .join("local-overrides/security-setup-reminder/disabled")
++            .exists()
++    {
++        tracing::debug!("optional security setup reminder disabled by local preference");
++        return;
++    }
+     if config.model_provider_id != "openai" || server.uses_remote_workspace() {
+         return;
+     }
+diff --git a/codex-rs/tui/src/tui/event_stream.rs b/codex-rs/tui/src/tui/event_stream.rs
+index 3ed439eec65824f9ff3f3fc5762c88848b295c9c..917e17606010aec8102eb1178aa6f886f8956b9e 100644
+--- a/codex-rs/tui/src/tui/event_stream.rs
++++ b/codex-rs/tui/src/tui/event_stream.rs
+@@ -177,6 +177,7 @@ pub struct TuiEventStream<S: EventSource + Default + Unpin = CrosstermEventSourc
+     resume_stream: WatchStream<()>,
+     terminal_focused: Arc<AtomicBool>,
+     poll_draw_first: bool,
++    wheel_events_since_draw: usize,
+     #[cfg(unix)]
+     suspend_context: crate::tui::job_control::SuspendContext,
+     #[cfg(unix)]
+@@ -198,6 +199,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
+             resume_stream,
+             terminal_focused,
+             poll_draw_first: false,
++            wheel_events_since_draw: 0,
+             #[cfg(unix)]
+             suspend_context,
+             #[cfg(unix)]
+@@ -323,27 +325,41 @@ impl<S: EventSource + Default + Unpin> Stream for TuiEventStream<S> {
+     type Item = TuiEvent;
+ 
+     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+-        // approximate fairness + no starvation via round-robin.
+-        let draw_first = self.poll_draw_first;
++        // Consume ready wheel input before drawing intermediate positions, while
++        // allowing a pending frame through during a sustained stream of input.
++        const MAX_WHEEL_EVENTS_PER_FRAME: usize = 64;
++        let draw_first = match self.wheel_events_since_draw {
++            0 => self.poll_draw_first,
++            count => count >= MAX_WHEEL_EVENTS_PER_FRAME,
++        };
+         self.poll_draw_first = !self.poll_draw_first;
+ 
+-        if draw_first {
+-            if let Poll::Ready(event) = self.poll_draw_event(cx) {
+-                return Poll::Ready(event);
+-            }
+-            if let Poll::Ready(event) = self.poll_crossterm_event(cx) {
+-                return Poll::Ready(event);
++        let result = if draw_first {
++            match self.poll_draw_event(cx) {
++                Poll::Pending => self.poll_crossterm_event(cx),
++                ready => ready,
+             }
+         } else {
+-            if let Poll::Ready(event) = self.poll_crossterm_event(cx) {
+-                return Poll::Ready(event);
++            match self.poll_crossterm_event(cx) {
++                Poll::Pending => self.poll_draw_event(cx),
++                ready => ready,
+             }
+-            if let Poll::Ready(event) = self.poll_draw_event(cx) {
+-                return Poll::Ready(event);
++        };
++        if let Poll::Ready(Some(event)) = &result {
++            if matches!(event, TuiEvent::Mouse(mouse) if matches!(
++                mouse.kind,
++                crossterm::event::MouseEventKind::ScrollUp
++                    | crossterm::event::MouseEventKind::ScrollDown
++            )) {
++                self.wheel_events_since_draw = self.wheel_events_since_draw.saturating_add(1);
++            } else {
++                self.wheel_events_since_draw = 0;
++                if matches!(event, TuiEvent::Draw) {
++                    self.poll_draw_first = false;
++                }
+             }
+         }
+-
+-        Poll::Pending
++        result
+     }
+ }
+ 
+@@ -645,4 +661,69 @@ mod tests {
+             other => panic!("expected key event, got {other:?}"),
+         }
+     }
++
++    fn wheel(kind: MouseEventKind) -> EventResult {
++        Ok(Event::Mouse(MouseEvent {
++            kind,
++            column: 8,
++            row: 3,
++            modifiers: KeyModifiers::NONE,
++        }))
++    }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn wheel_burst_drains_in_order_before_a_pending_frame() {
++        let (broker, handle, draw_tx, draw_rx, focused) = setup();
++        let mut stream = make_stream(broker, draw_rx, focused);
++        let kinds = [
++            MouseEventKind::ScrollUp,
++            MouseEventKind::ScrollUp,
++            MouseEventKind::ScrollDown,
++            MouseEventKind::ScrollUp,
++        ];
++        draw_tx.send(()).unwrap();
++        for kind in kinds {
++            handle.send(wheel(kind));
++        }
++        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
++        handle.send(Ok(Event::Key(key)));
++        for expected in kinds {
++            match stream.next().await {
++                Some(TuiEvent::Mouse(actual)) => assert_eq!(actual.kind, expected),
++                actual => panic!("pending frame interrupted a ready wheel burst: {actual:?}"),
++            }
++        }
++        assert!(matches!(stream.next().await, Some(TuiEvent::Key(actual)) if actual == key));
++        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
++    }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn wheel_flood_yields_a_frame_without_losing_input() {
++        let (broker, handle, draw_tx, draw_rx, focused) = setup();
++        let mut stream = make_stream(broker, draw_rx, focused);
++        draw_tx.send(()).unwrap();
++        for _ in 0..65 {
++            handle.send(wheel(MouseEventKind::ScrollUp));
++        }
++        for _ in 0..64 {
++            assert!(matches!(stream.next().await, Some(TuiEvent::Mouse(_))));
++        }
++        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
++        assert!(matches!(stream.next().await, Some(TuiEvent::Mouse(_))));
++    }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn wheel_short_tail_draws_immediately_when_input_runs_out() {
++        let (broker, handle, draw_tx, draw_rx, focused) = setup();
++        let mut stream = make_stream(broker, draw_rx, focused);
++        handle.send(wheel(MouseEventKind::ScrollDown));
++        handle.send(wheel(MouseEventKind::ScrollDown));
++        draw_tx.send(()).unwrap();
++        assert!(matches!(stream.next().await, Some(TuiEvent::Mouse(_))));
++        assert!(matches!(stream.next().await, Some(TuiEvent::Mouse(_))));
++        let next = timeout(Duration::from_millis(50), stream.next())
++            .await
++            .unwrap();
++        assert!(matches!(next, Some(TuiEvent::Draw)));
++    }
+ }

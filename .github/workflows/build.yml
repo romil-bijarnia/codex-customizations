@@ -1,0 +1,55 @@
+name: Build custom Codex
+run-name: Codex ${{ inputs.upstream || 'latest-main' }}
+on:
+  workflow_dispatch:
+    inputs:
+      upstream:
+        description: Exact upstream SHA; leave empty to follow main
+        type: string
+        required: false
+  schedule:
+    - cron: '17 */6 * * *'
+  push:
+    branches: [main]
+permissions:
+  contents: write
+concurrency:
+  group: codex-development-build
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve upstream and check for an existing build
+        id: plan
+        env:
+          UPSTREAM_SHA: ${{ inputs.upstream }}
+        run: python3 build.py plan --upstream "$UPSTREAM_SHA" --out "$RUNNER_TEMP/plan.json"
+      - name: Prepare native build dependencies
+        if: steps.plan.outputs.exists != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang cmake libcap-dev libasound2-dev libudev-dev python3-venv
+          python3 -m venv .venv
+          .venv/bin/pip install pyte
+      - uses: actions/cache@v4
+        if: steps.plan.outputs.exists != 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/codex-customizations
+          key: codex-linux-arm64-${{ steps.plan.outputs.commit }}
+          restore-keys: codex-linux-arm64-
+      - name: Apply stored changes, build, check and publish
+        if: steps.plan.outputs.exists != 'true'
+        run: .venv/bin/python build.py build --plan "$RUNNER_TEMP/plan.json" --work "$RUNNER_TEMP/codex-build" --out "$RUNNER_TEMP/release" --publish
+      - name: Publish failure details without changing any installation
+        if: failure()
+        run: |
+          echo '## Codex customization update failed' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No installed package was changed. Review the specific patch/build/check failure above; do not discard the stored changes.' >> "$GITHUB_STEP_SUMMARY"

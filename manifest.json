@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "repository": "romil-bijarnia/codex-customizations",
+  "upstream_repository": "openai/codex",
+  "upstream_branch": "main",
+  "base_commit": "4e4767ffa763ec0d0a19e04cf8ff0163a987297b",
+  "patches": [
+    "patches/personal-cli.patch"
+  ],
+  "target": "aarch64-unknown-linux-gnu",
+  "resource_target": "aarch64-unknown-linux-musl",
+  "bootstrap_source_commit": "df3f70fd0176d92a2bf9819d5d2582e1594c61d4",
+  "imported_customizations_commit": "065255f13227c91e193c9825923fc5bdcfba1600"
+}
