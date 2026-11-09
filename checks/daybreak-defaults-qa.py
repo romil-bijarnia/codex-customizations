@@ -6,7 +6,6 @@ import http.server
 import importlib.util
 import json
 import os
-import re
 from pathlib import Path
 import threading
 import time
@@ -159,8 +158,9 @@ trust_level = "trusted"
         report['checks'].append('An independent CLI remains normal while a Daybreak session is active.')
 
         # Saved Daybreak metadata and the normal return pair survive closing the frontend.
-        thread_id = re.search(r'\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b',
-                              term.text()).group(0)
+        returns = list((profile / 'state/daybreak-return').glob('*.json'))
+        assert len(returns) == 1, 'Expected one saved Daybreak return selection.'
+        thread_id = returns[0].stem
         term.close()
         terms.remove(term)
         term = qa.Terminal(args.executable, profile, workspace, resume_thread=thread_id)
