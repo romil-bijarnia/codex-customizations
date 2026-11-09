@@ -164,6 +164,16 @@ def install_launcher():
     print(f'Installed codex update; ordinary Codex launches still execute {selected}.')
 
 
+def installed_matches(state):
+    if not state:
+        return False
+    try:
+        verify_package((PACKAGES / 'current').resolve(strict=True), state)
+        return True
+    except (OSError, RuntimeError, KeyError, ValueError, subprocess.SubprocessError):
+        return False
+
+
 def update(args):
     platform_check()
     if not args.kit_refreshed and refresh_kit():
@@ -180,7 +190,7 @@ def update(args):
         state = read_state()
         release = published(tag)
         info = {'upstream_commit': commit, 'patchset': digest, 'release_tag': tag,
-                'build_available': bool(release), 'already_installed': state.get('release_tag') == tag,
+                'build_available': bool(release), 'already_installed': state.get('release_tag') == tag and installed_matches(state),
                 'source_checkout_required': False}
         if args.check:
             print(json.dumps(info, indent=2))
@@ -206,7 +216,11 @@ def update(args):
                     latest = matching[0]
                     message = latest['status'] + ' ' + latest['html_url']
                     if latest['status'] == 'completed' and latest.get('conclusion') not in ('success', 'skipped'):
-                        raise RuntimeError(f"The automated build failed ({latest.get('conclusion')}): {latest['html_url']} . Your installation is unchanged.")
+                        other_active = any(r['status'] in ('queued', 'pending', 'in_progress', 'waiting') for r in runs)
+                        if latest.get('conclusion') == 'cancelled' and other_active:
+                            message = f"Request superseded; waiting for the build already running: https://github.com/{REPO}/actions"
+                        else:
+                            raise RuntimeError(f"The automated build failed ({latest.get('conclusion')}): {latest['html_url']} . Your installation is unchanged.")
                 else:
                     message = f'Waiting for GitHub Actions: https://github.com/{REPO}/actions'
                 if message != last_message:

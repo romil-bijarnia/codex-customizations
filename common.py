@@ -36,9 +36,11 @@ def sha256(path):
 
 def patch_id():
     digest = hashlib.sha256()
-    for path in sorted([ROOT / 'manifest.json', *list((ROOT / 'patches').rglob('*')), *list((ROOT / 'overlays').rglob('*'))]):
+    tracked = subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', '-z', 'manifest.json', 'patches', 'overlays'])
+    for name in sorted(raw.decode() for raw in tracked.split(b'\0') if raw):
+        path = ROOT / name
         if path.is_file():
-            digest.update(str(path.relative_to(ROOT)).encode() + b'\0' + path.read_bytes() + b'\0')
+            digest.update(name.encode() + b'\0' + path.read_bytes() + b'\0')
     return digest.hexdigest()
 
 
