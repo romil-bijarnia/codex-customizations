@@ -1,3 +1,17 @@
+# Historical package workflow
+
+The active repository now contains the full Codex source on the
+[`personal` branch](https://github.com/romil-bijarnia/codex-customizations/tree/personal).
+Custom changes are ordinary Git commits and upstream updates use normal Git merges.
+On the current machine the active source checkout is `$HOME/Work/codex`.
+
+This `main` branch is retained to preserve the earlier package-workflow history.
+Its scheduled build workflow is disabled. Do not make new CLI or prompt changes
+here; use the active source branch and its `local-customizations/WORKFLOW.md`.
+The documentation below describes the retired workflow, not the current updater.
+
+---
+
 # Personal Codex changes, not another Codex repository
 
 This standalone repository contains only the differences from official Codex,
