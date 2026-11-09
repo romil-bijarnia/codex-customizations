@@ -33,6 +33,14 @@ Ordinary CLI arguments are passed directly to the selected native executable.
 No prompt, account, chat history, personal database or access setting is replaced.
 The two owned API/visualization helpers are updated along with their native CLI.
 
+Normal startup keeps the saved model, reasoning and permission defaults. The
+`/daybreak` toggle independently selects GPT-6-Sol with Daybreak Blue and Extra high
+reasoning for the active conversation, retaining its permissions, including EL2
+Control. Turning Daybreak off restores that conversation's previous model and
+reasoning. It does not overwrite the normal launch defaults or enable Daybreak
+for other conversations. Blue and Extra high must both be advertised by the server;
+if unavailable, the selection is left unchanged rather than silently downgraded.
+
 ## What is the stored difference?
 
 - `patches/personal-cli.patch`: code changes relative to the official commit in

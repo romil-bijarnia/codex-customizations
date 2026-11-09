@@ -13829,15 +13829,16 @@ index cb28791ff1..d4cdf4430d 100644
          }
      }
 diff --git c/codex-rs/tui/src/app/daybreak.rs w/codex-rs/tui/src/app/daybreak.rs
-index 31a70f2a9d..a7a6b15b0f 100644
+index 31a70f2a9d..0b1b02bf74 100644
 --- c/codex-rs/tui/src/app/daybreak.rs
 +++ w/codex-rs/tui/src/app/daybreak.rs
-@@ -1,8 +1,83 @@
- //! Persist the user's Daybreak selection for the active thread and new threads.
+@@ -1,8 +1,78 @@
+-//! Persist the user's Daybreak selection for the active thread and new threads.
++//! Select Daybreak Blue at Extra high for this thread without changing launch defaults.
  
  use super::*;
-+use crate::app_server_session::ThreadSettingsOwner;
 +use codex_protocol::openai_models::ReasoningEffort;
++use codex_protocol::turn_input::CyberAccessProgram;
 +
 +#[derive(serde::Serialize, serde::Deserialize)]
 +struct DaybreakReturnSelection {
@@ -13902,13 +13903,8 @@ index 31a70f2a9d..a7a6b15b0f 100644
 +        {
 +            return true;
 +        }
-+        if app_server.thread_params_mode().settings_owner() == ThreadSettingsOwner::Server {
-+            self.select_session_model(app_server, model.clone(), effort.clone(), None)
-+                .await;
-+        } else {
-+            self.apply_default_model_selection(app_server, model.clone(), effort.clone())
-+                .await;
-+        }
++        self.select_session_model(app_server, model.clone(), effort.clone(), None)
++            .await;
 +        self.chat_widget.current_model() == model
 +            && self.chat_widget.effective_reasoning_effort() == effort
 +    }
@@ -13916,10 +13912,11 @@ index 31a70f2a9d..a7a6b15b0f 100644
      pub(super) async fn persist_daybreak_selection(
          &mut self,
          app_server: &mut AppServerSession,
-@@ -27,6 +102,145 @@ impl App {
+@@ -26,6 +96,128 @@
+                 "Daybreak availability could not be confirmed for this account.".into(),
              );
              return;
-         }
++        }
 +        let return_selection = if enabled {
 +            Some(DaybreakReturnSelection {
 +                model: self.chat_widget.current_model().to_string(),
@@ -13943,34 +13940,23 @@ index 31a70f2a9d..a7a6b15b0f 100644
 +                }
 +            }
 +        };
-+        let switch_to_sol = enabled
-+            && crate::daybreak::program_for_turn(
-+                &self.chat_widget.model_catalog().models,
-+                self.chat_widget.current_model(),
-+                self.chat_widget.daybreak_account_eligible(),
-+                /*enabled*/ true,
-+            )
-+            .is_err();
-+        if switch_to_sol {
++        if enabled {
 +            let supported = self.chat_widget.model_catalog().models.iter().any(|model| {
 +                model.model == "gpt-6-sol"
 +                    && model
 +                        .available_access_programs
 +                        .as_ref()
-+                        .and_then(codex_protocol::openai_models::ModelAccessPrograms::daybreak)
-+                        .is_some()
-+                    && return_selection.as_ref().is_some_and(|selection| {
-+                        selection.effort.as_ref().is_none_or(|effort| {
-+                            model
-+                                .supported_reasoning_efforts
-+                                .iter()
-+                                .any(|option| &option.effort == effort)
++                        .is_some_and(|programs| {
++                            programs.cyber.contains(&CyberAccessProgram::DaybreakBlue)
 +                        })
-+                    })
++                    && model
++                        .supported_reasoning_efforts
++                        .iter()
++                        .any(|option| option.effort == ReasoningEffort::XHigh)
 +            });
 +            if !supported || self.chat_widget.restrict_model_picker_to_luna_reserve() {
 +                self.chat_widget.add_error_message(
-+                    "Daybreak requires GPT-6-Sol with your current reasoning level, but that combination is unavailable. Your model and Daybreak setting were not changed.".into(),
++                    "Daybreak defaults require GPT-6-Sol with Daybreak Blue and Extra high reasoning, but that combination is unavailable. Your model and Daybreak setting were not changed.".into(),
 +                );
 +                return;
 +            }
@@ -13992,19 +13978,13 @@ index 31a70f2a9d..a7a6b15b0f 100644
 +                return;
 +            }
 +        }
-+        if switch_to_sol
++        if enabled
 +            && !self
-+                .apply_daybreak_model(
-+                    app_server,
-+                    "gpt-6-sol".into(),
-+                    return_selection
-+                        .as_ref()
-+                        .and_then(|selection| selection.effort.clone()),
-+                )
++                .apply_daybreak_model(app_server, "gpt-6-sol".into(), Some(ReasoningEffort::XHigh))
 +                .await
 +        {
 +            self.chat_widget.add_error_message(
-+                "Could not switch to GPT-6-Sol at the current reasoning level; Daybreak was not enabled.".into(),
++                "Could not switch to GPT-6-Sol at Extra high reasoning; Daybreak was not enabled.".into(),
 +            );
 +            return;
 +        }
@@ -14012,7 +13992,7 @@ index 31a70f2a9d..a7a6b15b0f 100644
 +            .save_daybreak_preference(app_server, thread_id, enabled)
 +            .await
 +        {
-+            if switch_to_sol
++            if enabled
 +                && let Some(selection) = return_selection
 +                && self
 +                    .apply_daybreak_model(app_server, selection.model, selection.effort)
@@ -14058,11 +14038,10 @@ index 31a70f2a9d..a7a6b15b0f 100644
 +    ) -> bool {
 +        if self.active_thread_id != Some(thread_id) {
 +            return false;
-+        }
+         }
          match app_server
              .thread_read(thread_id, /*include_turns*/ false)
-             .await
-@@ -50,7 +264,7 @@ impl App {
+@@ -50,7 +242,7 @@
                      self.chat_widget.add_error_message(format!(
                          "Failed to save Daybreak for this thread: {error}"
                      ));
@@ -14071,7 +14050,7 @@ index 31a70f2a9d..a7a6b15b0f 100644
                  }
              }
              Ok(_) => {}
-@@ -58,7 +272,7 @@ impl App {
+@@ -58,7 +250,7 @@
                  self.chat_widget.add_error_message(format!(
                      "Failed to read the thread to save Daybreak: {error}"
                  ));
@@ -14080,7 +14059,52 @@ index 31a70f2a9d..a7a6b15b0f 100644
              }
          }
          self.chat_widget.set_daybreak_enabled(enabled);
-@@ -119,5 +333,6 @@ impl App {
+@@ -74,44 +266,6 @@
+             }
+         }
+         self.refresh_status_line();
+-        let edits = vec![crate::config_update::replace_config_value(
+-            "daybreak",
+-            serde_json::json!(enabled),
+-        )];
+-        match self
+-            .persist_model_defaults(
+-                app_server.request_handle(),
+-                edits,
+-                "default Daybreak preference",
+-            )
+-            .await
+-        {
+-            Ok(()) => match crate::config_update::read_effective_config(
+-                app_server.request_handle(),
+-                self.chat_widget
+-                    .config_ref()
+-                    .cwd
+-                    .to_string_lossy()
+-                    .into_owned(),
+-            )
+-            .await
+-            {
+-                Ok(response) => {
+-                    self.config.daybreak_enabled = response
+-                        .config
+-                        .additional
+-                        .get("daybreak")
+-                        .and_then(serde_json::Value::as_bool)
+-                        .unwrap_or(false)
+-                }
+-                Err(error) => self.chat_widget.add_error_message(format!(
+-                    "Failed to read the default Daybreak preference: {error}"
+-                )),
+-            },
+-            Err(error) => self.chat_widget.add_error_message(format!(
+-                "Failed to save the default Daybreak preference: {error}"
+-            )),
+-        }
+         self.chat_widget.add_info_message(
+             format!(
+                 "Daybreak {}. Applies to new turns.",
+@@ -119,5 +273,6 @@
              ),
              /*hint*/ None,
          );
@@ -14527,10 +14551,10 @@ index 7834b9c675..b5f4ace34e 100644
              }
              if self
 diff --git c/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs w/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
-index d8c96a4942..2b28d46af4 100644
+index d8c96a4942..623fabde91 100644
 --- c/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
 +++ w/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
-@@ -587,6 +587,14 @@ async fn queued_start_rejection_restores_the_draft() -> Result<()> {
+@@ -587,6 +587,14 @@
  pub(super) type RecordedRequests = Arc<Mutex<Vec<JSONRPCRequest>>>;
  pub(super) type RecordingAppServer = (AppServerSession, RecordedRequests, JoinHandle<Result<()>>);
  
@@ -14545,10 +14569,12 @@ index d8c96a4942..2b28d46af4 100644
  fn is_recording_client_disconnect(error: &WebSocketError) -> bool {
      match error {
          WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
-@@ -600,6 +608,89 @@ fn is_recording_client_disconnect(error: &WebSocketError) -> bool {
+@@ -598,6 +606,95 @@
+         ),
+         _ => false,
      }
- }
- 
++}
++
 +#[tokio::test]
 +async fn daybreak_command_switches_and_restores_the_model_and_reasoning() -> Result<()> {
 +    use codex_protocol::openai_models::ModelAccessPrograms;
@@ -14579,6 +14605,10 @@ index d8c96a4942..2b28d46af4 100644
 +    });
 +    let mut sol = original.clone();
 +    sol.model = "gpt-6-sol".into();
++    sol.supported_reasoning_efforts.push(codex_protocol::openai_models::ReasoningEffortPreset {
++        effort: ReasoningEffort::XHigh,
++        description: "Extra high".into(),
++    });
 +    sol.available_access_programs = Some(ModelAccessPrograms {
 +        cyber: vec![
 +            CyberAccessProgram::Standard,
@@ -14596,9 +14626,11 @@ index d8c96a4942..2b28d46af4 100644
 +    assert_eq!(app.chat_widget.current_model(), "gpt-6-sol");
 +    assert_eq!(
 +        app.chat_widget.effective_reasoning_effort(),
-+        original_effort
++        Some(ReasoningEffort::XHigh)
 +    );
 +    assert!(daybreak_return_path_for_test(&app, thread_id).is_file());
++    assert!(!app.config.daybreak_enabled);
++    assert!(recorded_params(&_requests, "config/batchWrite").is_empty());
 +
 +    app.persist_daybreak_selection(&mut server, thread_id, false)
 +        .await;
@@ -14630,11 +14662,38 @@ index d8c96a4942..2b28d46af4 100644
 +    server.shutdown().await?;
 +    proxy.await??;
 +    Ok(())
-+}
-+
+ }
+ 
  #[tokio::test]
- async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
-     use codex_protocol::openai_models::ModelAccessPrograms;
+@@ -648,7 +745,13 @@
+         })
+         .expect("model catalog request");
+     let mut model = crate::test_support::TEST_MODEL_PRESETS[0].clone();
+-    model.model = app.chat_widget.current_model().to_string();
++    model.model = "gpt-6-sol".into();
++    model.supported_reasoning_efforts.push(codex_protocol::openai_models::ReasoningEffortPreset {
++        effort: ReasoningEffort::XHigh,
++        description: "Extra high".into(),
++    });
++    app.chat_widget.set_model("gpt-6-sol");
++    app.chat_widget.set_reasoning_effort(Some(ReasoningEffort::XHigh));
+     model.available_access_programs = Some(ModelAccessPrograms {
+         cyber: vec![
+             CyberAccessProgram::Standard,
+@@ -685,11 +788,8 @@
+                 .daybreak_enabled,
+             Some(enabled)
+         );
+-        assert_eq!(app.config.daybreak_enabled, enabled);
+-        let writes = recorded_params(&requests, "config/batchWrite");
+-        let edit = &writes.last().expect("config write")["edits"][0];
+-        assert_eq!(edit["keyPath"], "daybreak");
+-        assert_eq!(edit["value"], enabled);
++        assert!(!app.config.daybreak_enabled);
++        assert!(recorded_params(&requests, "config/batchWrite").is_empty());
+     }
+     insta::assert_snapshot!("daybreak_toggle_confirmations", confirmations.join("\n\n"));
+ 
 diff --git c/codex-rs/tui/src/app/thread_goal_actions.rs w/codex-rs/tui/src/app/thread_goal_actions.rs
 index 166e090109..4bd6ab618b 100644
 --- c/codex-rs/tui/src/app/thread_goal_actions.rs

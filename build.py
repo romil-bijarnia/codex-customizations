@@ -177,7 +177,7 @@ def build(work, build_plan, output_dir):
     test_env = dict(os.environ, HOME=str(qa_home))
     test_env.pop('CODEX_HOME', None)
     suites = []
-    for name, script, extra in [('defaults','defaults-qa.py',[]),('picker-display','picker-order-qa.py',['--display-only']),('integrations-portable','terminal-integrations-qa.py',['--without-bundled-renderer']),('regressions','cli-regression-qa.py',['--source',str(source)]),('steering','steering-qa.py',[])]:
+    for name, script, extra in [('defaults','defaults-qa.py',[]),('daybreak-defaults','daybreak-defaults-qa.py',[]),('picker-display','picker-order-qa.py',['--display-only']),('integrations-portable','terminal-integrations-qa.py',['--without-bundled-renderer']),('regressions','cli-regression-qa.py',['--source',str(source)]),('steering','steering-qa.py',[])]:
         run([python, ROOT / 'checks' / script, package / 'bin/codex', work / 'checks' / name, *extra], env=test_env)
         suites.append(name)
     manifest = package_manifest(package, build_plan, check_suites=suites, real_model_requests=0,
