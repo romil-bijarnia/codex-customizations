@@ -95,3 +95,8 @@ checkout, only byte-identical tracked files regain their prior timestamps;
 changed files retain new timestamps and are rebuilt. This avoids rebuilding
 every unchanged workspace crate merely because CI performed a new checkout.
 Completed compilation is cached even if a subsequent runtime check fails.
+
+The CLI's `--version` reports the compiled development series (for example
+`0.169.0-dev`). The package manifest and `codex custom-status` carry the complete
+source revision, patch digest and build label. These are deliberately distinct;
+the updater verifies both metadata and exact executable checksums.

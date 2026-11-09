@@ -105,6 +105,21 @@ class UpdateTests(unittest.TestCase):
             build.source_times(source,restore=True)
             self.assertEqual(file.stat().st_mtime_ns,stamp+2000000000)
 
+    def test_compiled_series_version_is_distinct_from_package_provenance(self):
+        package, manifest = self.candidate()
+        version = '2.3.4-dev.20261109+romil.abcdef012345.01234567'
+        (package / 'codex-package.json').write_text(json.dumps({'target':manage.TARGET,'version':version}))
+        binary = package / 'bin/codex'
+        binary.write_text('#!/bin/sh\nprintf "codex-cli 2.3.4-dev\\n"\n')
+        manifest.update(version=version,compiled_version='2.3.4-dev',build_kind='remote-source-build')
+        manifest['binary_sha256']['codex'] = sha256(binary)
+        manage.verify_package(package,manifest)
+        del manifest['compiled_version']
+        manage.verify_package(package,manifest)
+        binary.write_text('#!/bin/sh\nprintf "codex-cli 2.3.4-alpha\\n"\n')
+        manifest['binary_sha256']['codex'] = sha256(binary)
+        with self.assertRaises(RuntimeError):manage.verify_package(package,manifest)
+
     def test_archive_path_escape_is_rejected(self):
         archive = self.home / 'bad.tar.gz'
         with tarfile.open(archive,'w:gz') as f:

@@ -81,8 +81,13 @@ def verify_package(package, manifest):
         if sha256(package / 'bin' / name) != manifest['binary_sha256'][name]:
             raise RuntimeError(f'Package executable checksum mismatch: {name}')
     actual = output([package / 'bin/codex', '--version'])
-    if manifest['version'] not in actual:
-        raise RuntimeError(f'The downloaded executable reported an unexpected version: {actual}')
+    expected = manifest.get('compiled_version', manifest['version'])
+    if 'compiled_version' not in manifest and manifest.get('build_kind') == 'remote-source-build':
+        # Compatibility with the first published development package: Cargo's
+        # version is constant within a series; package metadata carries the SHA.
+        expected = re.sub(r'-dev\.\d{8}\+romil\.[0-9a-f]+\.[0-9a-f]+$', '-dev', expected)
+    if actual != 'codex-cli ' + expected:
+        raise RuntimeError(f'The downloaded executable reported an unexpected version: {actual}; expected {expected}')
 
 
 def verify_local_checks(package, manifest):

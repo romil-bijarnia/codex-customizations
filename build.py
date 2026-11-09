@@ -181,7 +181,7 @@ def build(work, build_plan, output_dir):
         run([python, ROOT / 'checks' / script, package / 'bin/codex', work / 'checks' / name, *extra], env=test_env)
         suites.append(name)
     manifest = package_manifest(package, build_plan, check_suites=suites, real_model_requests=0,
-                                kernel_activation_verified=False, required_local_checks=['bundled-visualization-renderer'], official_resources_tag=release['tag_name'], build_kind='remote-source-build')
+                                kernel_activation_verified=False, compiled_version=cargo_version, required_local_checks=['bundled-visualization-renderer'], official_resources_tag=release['tag_name'], build_kind='remote-source-build')
     (package / 'custom-build.json').write_text(json.dumps(manifest, indent=2) + '\n')
     manifest = archive_package(package, output_dir, manifest)
     return manifest
