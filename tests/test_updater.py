@@ -1,4 +1,5 @@
 """Focused filesystem checks for installation safety and CLI argument forwarding."""
+import contextlib
 import io
 import json
 import os
@@ -133,6 +134,15 @@ class UpdateTests(unittest.TestCase):
         env=dict(os.environ,CODEX_HOME=str(self.profile))
         result=subprocess.run([str(manage.ROOT / 'bin/codex'),'--version'],env=env,text=True,capture_output=True,check=True)
         self.assertEqual(result.stdout.strip(),'codex-cli 2.3.4')
+
+    def test_launcher_install_is_idempotent_and_preserves_profile(self):
+        package, _ = self.candidate();(self.packages / 'current').unlink();(self.packages / 'current').symlink_to(package)
+        before = (self.profile / 'config.toml').read_bytes()
+        with patch.object(manage, 'platform_check'), contextlib.redirect_stdout(io.StringIO()):
+            manage.install_launcher()
+            manage.install_launcher()
+        self.assertEqual((self.home / '.local/bin/codex').resolve(), (manage.ROOT / 'bin/codex').resolve())
+        self.assertEqual((self.profile / 'config.toml').read_bytes(), before)
 
 
 if __name__ == '__main__':unittest.main()

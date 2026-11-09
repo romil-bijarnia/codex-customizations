@@ -189,16 +189,11 @@ def install_launcher():
     selected = (PACKAGES / 'current/bin/codex').resolve(strict=True)
     launcher = HOME / '.local/bin/codex'
     own = ROOT / 'bin/codex'
-    plus = HOME / '.local/bin/codex+1'
     if launcher.exists() and launcher.resolve() not in (selected, own.resolve()):
         raise RuntimeError(f'The existing launcher is not the selected personal Codex: {launcher}')
-    if (plus.exists() or plus.is_symlink()) and plus.resolve() != (ROOT / 'bin/codex+1').resolve():
-        raise RuntimeError(f'The existing codex+1 command is unrelated: {plus}')
     own.chmod(0o755)
-    (ROOT / 'bin/codex+1').chmod(0o755)
     atomic_link(launcher, own)
-    atomic_link(plus, ROOT / 'bin/codex+1')
-    print(f'Installed codex update and codex+1; ordinary Codex launches still execute {selected}.')
+    print(f'Installed the codex update launcher; ordinary Codex launches still execute {selected}.')
 
 
 def installed_matches(state):
